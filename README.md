@@ -30,12 +30,14 @@ Flexible Input Modes: Supports batch processing from standard CSV catalogs, manu
 Output File Structure
 Processed outputs are automatically organized into FITS files and a local ./spectra/ directory:
 
-Plaintext
-.
+
 ├── spherex_cube_<target>_combined.fits     # Master 3D Datacube (Data + MJD HDUs)
+
 ├── spherex_cube_<target>_epoch1.fits       # Epoch-specific 3D Datacube
+
 └── spectra/
     ├── <target>_combined_ap_<radius>.csv   # Extracted 1D spectrum, MJDs & uncertainties
     └── <target>_multiepoch_cutout.png      # 1D Spectrum plot & 2D spatial aperture overlay
+    
 
     
