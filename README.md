@@ -36,7 +36,10 @@ Processed outputs are automatically organized into FITS files and a local ./spec
 ├── spherex_cube_<target>_epoch1.fits       # Epoch-specific 3D Datacube
 
 └── spectra/
+
     ├── <target>_combined_ap_<radius>.csv   # Extracted 1D spectrum, MJDs & uncertainties
+
+    
     └── <target>_multiepoch_cutout.png      # 1D Spectrum plot & 2D spatial aperture overlay
     
 
