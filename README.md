@@ -1,6 +1,6 @@
-# SPHEREx_cube
+# SPICED— SPHEREx Interpolated Cube Extraction \& Data Pipeline a
 
-SPHEREx 3D Datacube Builder & Photometry Pipeline
+SPHEREx 3D Datacube Builder & Photometry Pipeline 
 
 Please cite M. Narang et al., (in prep)
 
