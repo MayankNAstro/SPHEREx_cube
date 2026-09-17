@@ -1,4 +1,5 @@
-# SPICED— SPHEREx Interpolated Cube Extraction \& Data Pipeline a
+# SPICED— SPHEREx Interpolated Cube Extraction \& Data Pipeline
+
 
 SPHEREx 3D Datacube Builder & Photometry Pipeline 
 
