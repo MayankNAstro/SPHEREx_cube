@@ -1,4 +1,17 @@
 ### ==============================
+# SPHEREx datacube builder — v2
+# Spatial resampling: STScI drizzle package (pip install drizzle), the AstroDrizzle engine.
+# Spectral axis: each epoch is built separately.  Every drizzled sample keeps its own
+# wavelength (pixel- and epoch-dependent) and is assigned to a uniform common wavelength
+# grid with a spectral kernel whose width follows the SPHEREx resolution element
+# lambda/R of the node's detector band (R = 41/41/41/35/110/130).  Samples within the
+# kernel are averaged.  DEFAULT kernel = "response": each sample is weighted by its own
+# SPHEREx bandpass from the SSDC R7 spectral calibration: profiles generated from Table 2 of
+# the R7 note (lambda_c, R per channel; built into this script); the R7 CSVs are used if found.
+# Alternative: tent = triangular weights of FWHM lambda/R.  Samples never
+# mix detector bands.  Epoch cubes are then median-combined as in v1.
+# One aperture CSV holds the combined cube, every epoch, and the median of the epoch spectra.
+### ==============================
 # Core Python & Scientific Stack
 # ==============================
 import os
@@ -35,6 +48,7 @@ from astroquery.vizier import Vizier
 # Photometry & VO Access
 # ==============================
 from photutils.aperture import (
+    CircularAperture,
     SkyCircularAperture,
     SkyCircularAnnulus,
     aperture_photometry,
@@ -42,12 +56,16 @@ from photutils.aperture import (
 )
 import pyvo
 import urllib.error
+import urllib.request
 
 # ==============================
 # GUI / File Dialogs
 # ==============================
-import tkinter as tk
-from tkinter import filedialog
+try:                                    # file dialogs (interactive menu only)
+    import tkinter as tk
+    from tkinter import filedialog
+except ImportError:                     # headless / batch use
+    tk = filedialog = None
 
 matplotlib.use("Agg")   # Safe for headless execution / multiprocessing
 
@@ -91,13 +109,26 @@ def flag_bitmask(names=DEFAULT_BAD_FLAGS):
 # -------------------------------------------------
 # FITS open with retry
 # -------------------------------------------------
-def open_fits_with_retry(url, retries=10, base_delay=1, cache=False):
+def open_fits_with_retry(url, retries=10, base_delay=1, cache=False, timeout=120):
+    """Open a (remote) FITS file, retrying on network errors.
+
+    Remote files are read straight into memory.  (astropy's fits.open(url) writes every
+    download to a temporary file, astropy-download-<pid>-*, that is only deleted when Python
+    exits, so a long run over many targets filled the disk.)  Local paths open normally;
+    cache=True keeps the old behaviour (astropy download cache)."""
+    import io
+    is_remote = str(url).startswith(("http://", "https://", "ftp://"))
     for attempt in range(1, retries + 1):
         try:
-            return fits.open(url, cache=cache)
+            if not is_remote or cache:
+                return fits.open(url, cache=cache)
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                data = resp.read()
+            return fits.open(io.BytesIO(data))
         except (urllib.error.HTTPError,
                 urllib.error.URLError,
                 socket.gaierror,
+                socket.timeout,
                 OSError) as e:
             if attempt == retries:
                 raise
@@ -184,6 +215,7 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
 
             return {
                 "cutout_index": row["cutout_index"],
+                "band": band_from_name(row.get("energy_bandpassname", ""), lam),
                 "central_wavelength": lam,
                 "time_bounds_lower": row.get("time_bounds_lower", np.nan),
                 "bunit": bunit,
@@ -197,6 +229,7 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
         print(f" Failed cutout {row['cutout_index']}: {e}")
         return {
             "cutout_index": row["cutout_index"],
+            "band": -1,
             "central_wavelength": np.nan,
             "time_bounds_lower": row.get("time_bounds_lower", np.nan),
             "bunit": "MJy/sr",
@@ -290,83 +323,57 @@ def build_common_wave_grid(epoch_rows_list, oversample=1.0):
 
 
 # -------------------------------------------------
-# Resolution-preserving, NaN-aware image resampling
+# Spatial resampling
 # -------------------------------------------------
-# SPHEREx's PSF (FWHM ~6") is undersampled by its 6.15" pixels.
-#  * "drizzle" (default): each input pixel is shrunk to a drop of side `pixfrac`
-#    and its flux is shared among the output pixels the drop overlaps.  All
-#    weights are positive, so it cannot ring, and it conserves flux, while
-#    being sharper than bilinear (simulation: FWHM 6.4" vs 7.5" bilinear).
-#  * "lanczos3/lanczos2/cubic": sharpest, but their negative lobes ring around
-#    bright undersampled stars (dark moat ~2 px out, 2-8% of the peak).
-#  * "bilinear": smooth, no ringing, blurs the PSF by about one pixel.
-def _lanczos(t, a):
-    t = np.asarray(t, dtype=float)
-    return np.where(np.abs(t) < a, np.sinc(t) * np.sinc(t / a), 0.0)
-
-
-def _keys_cubic(t, a=-0.5):
-    t = np.abs(np.asarray(t, dtype=float))
-    return np.where(
-        t <= 1.0, (a + 2.0) * t**3 - (a + 3.0) * t**2 + 1.0,
-        np.where(t < 2.0, a * t**3 - 5.0 * a * t**2 + 8.0 * a * t - 4.0 * a, 0.0))
-
-
-# name -> (tap offsets relative to floor(x), 1-D kernel)
+# Images are drizzled with STScI's `drizzle` package (the drizzle engine behind
+# AstroDrizzle / drizzlepac; Fruchter & Hook 2002).  Each input pixel is shrunk to a
+# drop of side `pixfrac` and its surface brightness is shared among the output pixels
+# the drop overlaps, by exact overlap area: no ringing, flux conserved.
+# Bilinear interpolation is used only internally, for the smooth per-pixel wavelength maps.
 RESAMPLE_KERNELS = {
-    "lanczos3": (np.arange(-2, 4), lambda t: _lanczos(t, 3)),
-    "lanczos2": (np.arange(-1, 3), lambda t: _lanczos(t, 2)),
-    "cubic":    (np.arange(-1, 3), _keys_cubic),
     "bilinear": (np.array([0, 1]), lambda t: np.clip(1.0 - np.abs(t), 0.0, None)),
 }
-RESAMPLE_METHODS = ("drizzle",) + tuple(RESAMPLE_KERNELS) + ("nearest",)
+RESAMPLE_METHODS = ("drizzle",)
+
+# ---- Drizzle engine: STScI drizzle package (required: pip install drizzle) ----
+try:
+    import drizzle as _drizzle_pkg
+    from drizzle.resample import Drizzle as _STScIDrizzle
+    from drizzle.utils import calc_pixmap as _calc_pixmap
+except ImportError as _e:
+    raise ImportError("Cube_builder_sphereX_v2 needs STScI's drizzle package: "
+                      "pip install drizzle") from _e
+DRIZZLE_ENGINE = f"stsci drizzle {getattr(_drizzle_pkg, '__version__', '')}".strip()
 
 
-def drizzle_to_grid(data, wcs_in, wcs_out, shape_out, pixfrac=0.6, n_sub=4):
+def drizzle_to_grid(data, wcs_in, wcs_out, shape_out, pixfrac=0.6, weight=None):
     """
-    Flux-conserving 'drop' resampling of one image onto the output grid.
+    Drizzle one image onto the output grid with STScI's drizzle (square kernel).
 
-    Every finite input pixel is shrunk about its centre to a square drop of
-    side `pixfrac` (input pixels), split into n_sub x n_sub sub-points that are
-    mapped through both WCSs (SIP included) and binned into output pixels.
-    Output = overlap-weighted mean surface brightness; NaN where no drop lands.
+    Surface brightness in, surface brightness out.  calc_pixmap maps every input pixel
+    through both WCSs (SIP distortion included); the C code computes the exact overlap of
+    each drop with each output pixel.  weight: optional per-pixel weight map (e.g.
+    1/variance); default 1 for finite pixels.  NaN input pixels get zero weight; output
+    pixels that no drop reaches are NaN.
     """
-    data = np.asarray(data, dtype=np.float64)
-    ny, nx = data.shape
-    n_out_y, n_out_x = shape_out
-
-    # Output-pixel coordinates of every input pixel CORNER (one WCS call each way)
-    yc, xc = np.mgrid[0:ny + 1, 0:nx + 1] - 0.5
-    xo, yo = wcs_out.world_to_pixel(wcs_in.pixel_to_world(xc.ravel(), yc.ravel()))
-    xo = np.asarray(xo, dtype=np.float64).reshape(ny + 1, nx + 1)
-    yo = np.asarray(yo, dtype=np.float64).reshape(ny + 1, nx + 1)
-
+    data = np.asarray(data, dtype=np.float32)
     good = np.isfinite(data)
-    vals = data[good]
-    corners_x = [c[good] for c in (xo[:-1, :-1], xo[:-1, 1:], xo[1:, :-1], xo[1:, 1:])]
-    corners_y = [c[good] for c in (yo[:-1, :-1], yo[:-1, 1:], yo[1:, :-1], yo[1:, 1:])]
-
-    frac = 0.5 + ((np.arange(n_sub) + 0.5) / n_sub - 0.5) * pixfrac   # sub-point offsets in (0, 1)
-    acc  = np.zeros(n_out_y * n_out_x)
-    wsum = np.zeros(n_out_y * n_out_x)
-    for a in frac:            # along x
-        for b in frac:        # along y
-            w00, w10, w01, w11 = (1 - a) * (1 - b), a * (1 - b), (1 - a) * b, a * b
-            X = w00 * corners_x[0] + w10 * corners_x[1] + w01 * corners_x[2] + w11 * corners_x[3]
-            Y = w00 * corners_y[0] + w10 * corners_y[1] + w01 * corners_y[2] + w11 * corners_y[3]
-            ix, iy = np.rint(X).astype(int), np.rint(Y).astype(int)
-            ok = (ix >= 0) & (ix < n_out_x) & (iy >= 0) & (iy < n_out_y)
-            lin = iy[ok] * n_out_x + ix[ok]
-            acc  += np.bincount(lin, weights=vals[ok], minlength=acc.size)
-            wsum += np.bincount(lin, minlength=wsum.size)
-
-    out = np.full(acc.size, np.nan)
-    hit = wsum > 0
-    out[hit] = acc[hit] / wsum[hit]
-    return out.reshape(shape_out)
+    if weight is None:
+        wht = good.astype(np.float32)
+    else:
+        wht = np.where(good & np.isfinite(weight), weight, 0.0).astype(np.float32)
+    pixmap = _calc_pixmap(wcs_in, wcs_out, shape=data.shape)
+    drz = _STScIDrizzle(kernel="square", out_shape=tuple(shape_out), fillval=np.nan,
+                        disable_ctx=True)
+    # scale=1: input and output are both surface brightness (MJy/sr), so no pixel-area scaling
+    drz.add_image(np.where(good, data, 0.0).astype(np.float32), exptime=1.0, pixmap=pixmap,
+                  weight_map=wht, pixfrac=pixfrac, scale=1.0, in_units="cps")
+    out = np.asarray(drz.out_img, dtype=np.float64)
+    out[~(np.asarray(drz.out_wht) > 0)] = np.nan
+    return out
 
 
-def resample_to_grid(data, xin, yin, method="lanczos3", min_weight=0.5, chunk=50000):
+def resample_to_grid(data, xin, yin, method="bilinear", min_weight=0.5, chunk=50000):
     """
     Sample `data` at fractional input-pixel positions (xin, yin), 0-based.
 
@@ -386,18 +393,9 @@ def resample_to_grid(data, xin, yin, method="lanczos3", min_weight=0.5, chunk=50
     if not inside.any():
         return out
 
-    if method == "nearest":
-        ix = np.clip(np.rint(xin[inside]).astype(int), 0, nx_in - 1)
-        iy = np.clip(np.rint(yin[inside]).astype(int), 0, ny_in - 1)
-        out[inside] = data[iy, ix]
-        return out
-
-    if method == "drizzle":
-        raise ValueError("resample_to_grid interpolates; for 'drizzle' call drizzle_to_grid "
-                         "(it needs the input and output WCS).")
     if method not in RESAMPLE_KERNELS:
-        raise ValueError(f"Unknown resample method '{method}'. "
-                         f"Choose from {RESAMPLE_METHODS}.")
+        raise ValueError("resample_to_grid is only used (bilinear) for wavelength maps; "
+                         "images are drizzled with drizzle_to_grid.")
     taps, kern = RESAMPLE_KERNELS[method]
 
     finite = np.isfinite(data)
@@ -498,8 +496,7 @@ def create_rectified_cube(
     all_reprojected = np.full((n_in, n_y, n_x), np.nan)
     all_waves_rep   = np.full((n_in, n_y, n_x), np.nan)
 
-    how = (f"drizzle, pixfrac={pixfrac}" if resample_method == "drizzle"
-           else f"'{resample_method}' kernel")
+    how = f"{DRIZZLE_ENGINE}, pixfrac={pixfrac}"
     print(f" Resampling {n_in} slices onto master grid ({n_y}×{n_x}) with {how} …")
     for s, row in enumerate(valid_rows):
         hdu      = row["hdu"]
@@ -509,12 +506,8 @@ def create_rectified_cube(
         wcs_in = WCS(hdu.header, relax=True).celestial
         xin, yin = wcs_in.world_to_pixel(sky_out)
 
-        if resample_method == "drizzle":
-            all_reprojected[s] = drizzle_to_grid(
-                hdu.data, wcs_in, master_wcs, (n_y, n_x), pixfrac=pixfrac)
-        else:
-            all_reprojected[s] = resample_to_grid(
-                hdu.data, xin, yin, method=resample_method).reshape(n_y, n_x)
+        all_reprojected[s] = drizzle_to_grid(
+            hdu.data, wcs_in, master_wcs, (n_y, n_x), pixfrac=pixfrac)
         # The wavelength map is smooth, so plain bilinear is exact enough
         all_waves_rep[s] = resample_to_grid(
             wave_hdu.data, xin, yin, method="bilinear").reshape(n_y, n_x)
@@ -560,6 +553,7 @@ def create_rectified_cube(
     out_header["RESAMPLE"] = (resample_method, "spatial resampling method")
     if resample_method == "drizzle":
         out_header["PIXFRAC"] = (float(pixfrac), "drizzle drop size (input pixels)")
+        out_header["DRZENGIN"] = (DRIZZLE_ENGINE, "spatial resampling engine")
 
     if "PC1_1" in out_header:
         for tag in ["3_3", "1_3", "2_3", "3_1", "3_2"]:
@@ -570,6 +564,471 @@ def create_rectified_cube(
             out_header[f"CD{tag}"] = 0.0
 
     return cube_data, out_header, common_waves, common_mjds
+
+
+# -------------------------------------------------
+# v2: spectral kernel binning onto the common grid
+# -------------------------------------------------
+# band -> (lambda_min, lambda_max, R)
+SPHEREX_BANDS = {
+    1: (0.75, 1.11, 41.0), 2: (1.11, 1.64, 41.0), 3: (1.64, 2.42, 41.0),
+    4: (2.42, 3.82, 35.0), 5: (3.82, 4.42, 110.0), 6: (4.42, 5.00, 130.0),
+}
+
+# u = (lambda_sample - lambda_node) / kernel_FWHM
+SPECTRAL_KERNELS = {
+    "tent":  (lambda u: np.clip(1.0 - np.abs(u), 0.0, None), 1.0),       # triangle, half-base = FWHM
+}
+
+# ---- Instrument spectral response ("response" kernel) ----
+# Hui et al. 2026, ApJS 284, 10 and the SSDC R7 spectral-calibration delivery
+# ("SPHEREx spectral fiducial functions", Hui, July 2026):
+#   band centre  lambda_c = 50% point of the cumulative response;  dlambda = integral of the
+#   peak-normalised response;  R = lambda_c / dlambda.
+#   The fiducial responses are FLAT-TOPPED with steep edges (not Gaussian).  The middle-pixel
+#   (Cent) curve keeps the true per-pixel bandwidth, and a pixel away from the channel centre is
+#   well described by shifting that curve in wavelength (delivery note, Sect. 3).
+# With kernel="response" each sample s is weighted by ITS OWN bandpass evaluated at the node,
+# T_s(lambda_k): the voxel is the response-weighted mean of every measurement that has
+# sensitivity at lambda_k.
+#   * response_file given (the SSDC R7 delivery folder, its MiddlePixel/SubChannel17 folder, or
+#     a single table): the measured Cent curve of the nearest channel, shifted to lambda_s.
+#   * no file: a flat-topped super-Gaussian, T = exp(-ln2 |2 du / FWHM|^4), whose equivalent
+#     width is dlambda = kernel_fwhm * lambda_s / R(lambda_s), with R(lambda) interpolated
+#     from the per-channel table below (delivery note Table 2: median of the BC/BW maps).
+SUPERGAUSS_P = 4.0
+_SG_EQW = 0.9934        # equivalent width / FWHM for p = 4: Gamma(1+1/p) / ln2**(1/p)
+
+# Table 2 of the delivery note: per band, 17 channel centres [um] and median R
+SPHEREX_CHANNELS = {
+    1: ([0.753, 0.771, 0.790, 0.809, 0.828, 0.848, 0.868, 0.889, 0.910, 0.932, 0.955, 0.978,
+         1.001, 1.025, 1.050, 1.075, 1.102],
+        [42, 42, 41, 40, 40, 40, 40, 39, 39, 39, 39, 38, 38, 38, 38, 37, 37]),
+    2: ([1.113, 1.139, 1.167, 1.195, 1.224, 1.254, 1.284, 1.315, 1.346, 1.378, 1.412, 1.446,
+         1.481, 1.517, 1.554, 1.592, 1.631],
+        [43, 42, 42, 41, 41, 41, 42, 42, 42, 42, 41, 41, 41, 41, 41, 41, 41]),
+    3: ([1.656, 1.695, 1.735, 1.775, 1.818, 1.861, 1.905, 1.949, 1.995, 2.041, 2.089, 2.139,
+         2.189, 2.240, 2.292, 2.345, 2.399],
+        [42, 42, 41, 41, 41, 41, 41, 41, 41, 40, 40, 40, 40, 40, 40, 40, 41]),
+    4: ([2.445, 2.506, 2.575, 2.646, 2.719, 2.794, 2.871, 2.951, 3.033, 3.118, 3.204, 3.293,
+         3.383, 3.476, 3.570, 3.667, 3.768],
+        [42, 34, 35, 35, 35, 35, 34, 34, 34, 34, 35, 35, 35, 36, 36, 36, 36]),
+    5: ([3.833, 3.867, 3.901, 3.935, 3.970, 4.005, 4.040, 4.076, 4.112, 4.148, 4.184, 4.220,
+         4.257, 4.294, 4.331, 4.368, 4.405],
+        [109, 109, 109, 108, 109, 110, 110, 111, 112, 113, 113, 115, 114, 115, 116, 116, 117]),
+    6: ([4.435, 4.467, 4.500, 4.533, 4.566, 4.600, 4.635, 4.669, 4.704, 4.739, 4.773, 4.808,
+         4.843, 4.879, 4.915, 4.951, 4.988],
+        [128, 125, 127, 126, 127, 125, 127, 126, 128, 130, 131, 132, 131, 130, 130, 132, 135]),
+}
+
+
+def spherex_R(lam, band):
+    """Resolving power at lam (um) in detector band, interpolated over the 17 channels."""
+    lc, R = SPHEREX_CHANNELS[int(band)]
+    return np.interp(lam, lc, np.asarray(R, float))
+
+
+# ---- SSDC R7 response profiles generated from Table 2 of the R7 delivery note ----
+# For every one of the 102 channels (SPHEREX_CHANNELS above = Table 2: median band centre
+# lambda_c and median R = lambda_c / dlambda) a peak-normalised, flat-topped profile is built,
+# T(lambda) = exp(-ln2 |2 (lambda - lambda_c) / FWHM|^4), with FWHM chosen so that its
+# equivalent width (integral of T, the R7 definition of dlambda) equals lambda_c / R.
+# The flat top / steep edges follow the fiducial curves shown in the note (Figs. 3-5).
+# In use, a pixel's profile is the one of its nearest channel shifted to the pixel's own
+# wavelength (the note's prescription for off-centre pixels).
+
+def r7_table_profiles(nsamp_per_dlambda=40, extent=1.5):
+    """Response profiles of the 102 SPHEREx channels from Table 2, in load_response_table format."""
+    out = {}
+    for b, (lc, R) in SPHEREX_CHANNELS.items():
+        lc = np.asarray(lc, float); dl = lc / np.asarray(R, float)
+        fwhm = dl / _SG_EQW
+        step = dl.min() / nsamp_per_dlambda
+        span = extent * dl.max()
+        offs = np.arange(-span, span + step, step)
+        prof = np.exp(-np.log(2) * np.abs(2.0 * offs[None, :] / fwhm[:, None]) ** SUPERGAUSS_P)
+        prof[prof < 1e-4] = 0.0
+        out[b] = (lc, offs, prof)
+    out["_path"] = "SSDC R7 Table 2 (generated profiles)"
+    return out
+
+
+def resolve_response(response_file):
+    """"auto" -> R7 CSV delivery if found, else profiles generated from R7 Table 2;
+    "table2" -> the Table-2 profiles; "model" -> None (same shape, R interpolated between
+    channels); a path -> that CSV file/folder; a dict -> itself."""
+    if isinstance(response_file, dict):
+        return response_file
+    if response_file in (None, "", "model"):
+        return None
+    if response_file in ("table2", "builtin"):
+        return r7_table_profiles()
+    if response_file == "auto":
+        rf = find_ssdc_r7()
+        if rf:
+            return load_response_table(rf)
+        print("[INFO] Using SSDC R7 response profiles generated from Table 2 of the R7 note "
+              "(lambda_c and R of all 102 channels, flat-top shape).")
+        return r7_table_profiles()
+    return load_response_table(response_file)
+
+
+# Where the SSDC R7 spectral-calibration delivery is looked for when response_file="auto"
+# (the default).  Put the unpacked delivery (the folder containing MiddlePixel/) next to this
+# script or in the working directory, or set SPHEREX_SSDC_R7=/path/to/SSDC_R7.
+SSDC_R7_NAMES = ("SSDC_R7", "SSDC R7", "SSDC_R7_spectral", "SPHERExSpectralFiles", "ssdc_r7")
+
+
+def find_ssdc_r7():
+    """Return the SSDC R7 delivery folder, or None (then the built-in R7 Table-2 model is used)."""
+    import glob
+    env = os.environ.get("SPHEREX_SSDC_R7")
+    roots = [env] if env else []
+    here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    for base in dict.fromkeys([os.getcwd(), here]):
+        roots += [os.path.join(base, n) for n in SSDC_R7_NAMES]
+        roots += glob.glob(os.path.join(base, "*", "MiddlePixel", ".."))
+    for r in roots:
+        if r and os.path.isdir(r) and glob.glob(os.path.join(r, "**", "FiducialSpec*.csv"),
+                                                recursive=True):
+            return os.path.normpath(r)
+    return None
+
+
+def load_response_table(path):
+    """
+    Read fiducial channel responses into {band: (centres[nch], offsets[noff], prof[nch, noff])}.
+
+    Accepted layouts (FITS table or CSV/ECSV/ASCII readable by astropy Table):
+      * a wavelength column (name starting 'wav' or 'lam', um) plus one response column per
+        channel (any other numeric column), or
+      * a 2-D FITS image, response[channel, wavelength], with the wavelength vector in a
+        second HDU / a 'WAVELENGTH' column / the header axis 1 WCS.
+    Each channel is peak-normalised; its centre is the 50 % cumulative point (paper Eq. 3) and its
+    band is taken from that centre.  Responses below 1e-3 of the peak, and anything further than
+    4 x lambda_c/R from the centre (out-of-band leaks in bands 1-2), are set to zero.
+    """
+    from astropy.table import Table
+    import glob
+    if os.path.isdir(path):
+        return _load_response_dir(path)
+    wave, resp = None, None
+    try:
+        with fits.open(path) as hl:
+            for h in hl:
+                if isinstance(h, fits.ImageHDU) or (isinstance(h, fits.PrimaryHDU) and h.data is not None):
+                    if h.data is not None and h.data.ndim == 2:
+                        resp = np.asarray(h.data, float)
+                        hdr = h.header
+                elif isinstance(h, (fits.BinTableHDU, fits.TableHDU)):
+                    names = [c.lower() for c in h.columns.names]
+                    for c in h.columns.names:
+                        if c.lower().startswith(("wav", "lam")):
+                            wave = np.asarray(h.data[c], float).ravel()
+                    if resp is None and wave is not None and len(names) > 1:
+                        cols = [c for c in h.columns.names if not c.lower().startswith(("wav", "lam"))]
+                        resp = np.array([np.asarray(h.data[c], float) for c in cols])
+            if resp is not None and wave is None:
+                n = resp.shape[1]
+                wave = hdr.get("CRVAL1", 0) + (np.arange(n) + 1 - hdr.get("CRPIX1", 1)) * hdr.get("CDELT1", 1)
+    except OSError:
+        t = Table.read(path)
+        wcol = [c for c in t.colnames if c.lower().startswith(("wav", "lam"))][0]
+        wave = np.asarray(t[wcol], float)
+        resp = np.array([np.asarray(t[c], float) for c in t.colnames if c != wcol])
+    if resp is None or wave is None:
+        raise ValueError(f"Could not find wavelength + response arrays in {path}")
+    if resp.shape[0] == wave.size and resp.shape[1] != wave.size:
+        resp = resp.T
+    if np.nanmedian(wave) > 100:          # nm -> um
+        wave = wave / 1000.0
+
+    per_band = {}
+    for r in resp:
+        r = np.nan_to_num(r, nan=0.0)
+        if r.max() <= 0:
+            continue
+        r = r / r.max()
+        cum = np.cumsum(0.5 * (r[1:] + r[:-1]) * np.diff(wave))
+        lc = np.interp(0.5 * cum[-1], cum, 0.5 * (wave[1:] + wave[:-1]))
+        b = int(band_of_wavelength(lc))
+        R = float(spherex_R(lc, b))
+        off = wave - lc
+        r = np.where((np.abs(off) <= 4 * lc / R) & (r >= 1e-3), r, 0.0)
+        per_band.setdefault(b, []).append((lc, off, r))
+    out = {}
+    for b, chans in per_band.items():
+        chans.sort(key=lambda c: c[0])
+        span = max(np.max(np.abs(c[1][c[2] > 0])) for c in chans)
+        step = min(np.median(np.diff(c[1])) for c in chans)
+        offs = np.arange(-span, span + step, step)
+        prof = np.array([np.interp(offs, c[1], c[2], left=0.0, right=0.0) for c in chans])
+        out[b] = (np.array([c[0] for c in chans]), offs, prof)
+    print(f" Loaded spectral response for bands {sorted(out)} "
+          f"({', '.join(f'B{b}: {len(v[0])} ch' for b, v in sorted(out.items()) if b != '_path')}) "
+          f"from {path}")
+    out["_path"] = str(path)
+    return out
+
+
+def _load_response_dir(path, nsub=17, case="Cent"):
+    """
+    SSDC R7 spectral-calibration delivery: CSV files
+    <root>/MiddlePixel/SubChannel<N>/Band<b>/FiducialSpec_Band<b>_SubCh<XX>_<N>_Cent.csv
+    (columns: Wavelength [um], NormTransmission).  `path` may be the delivery root, the
+    MiddlePixel folder, a SubChannel<N> folder or a Band<b> folder.  Middle-pixel (Cent) curves
+    are used, as recommended for per-pixel work; off-centre pixels are handled by the shift
+    in _response_weights.  The 17 nominal sub-channels are used unless only another N is present.
+    """
+    import glob
+    import re
+    files = sorted(glob.glob(os.path.join(path, "**", f"*FiducialSpec*{case}*.csv"), recursive=True))
+    if not files:
+        files = sorted(glob.glob(os.path.join(path, "**", "*FiducialSpec*.csv"), recursive=True))
+    if not files:
+        raise FileNotFoundError(f"No FiducialSpec*.csv files under {path}")
+
+    def nsub_of(f):
+        m = re.search(r"SubCh\D?(\d+)\D(\d+)", os.path.basename(f))
+        return int(m.group(2)) if m else None
+    avail = {nsub_of(f) for f in files}
+    use_n = nsub if nsub in avail else sorted(a for a in avail if a is not None)[0] if avail - {None} else None
+    if use_n is not None:
+        files = [f for f in files if nsub_of(f) == use_n]
+
+    per_band = {}
+    for f in files:
+        try:
+            arr = np.genfromtxt(f, delimiter=",", comments="#", invalid_raise=False)
+            arr = arr[np.all(np.isfinite(arr[:, :2]), axis=1)]
+        except Exception:
+            continue
+        if arr.ndim != 2 or arr.shape[0] < 5:
+            continue
+        wave, r = arr[:, 0], arr[:, 1]
+        o = np.argsort(wave)
+        wave, r = wave[o], np.clip(r[o], 0.0, None)
+        if np.nanmedian(wave) > 100:
+            wave = wave / 1000.0
+        if r.max() <= 0:
+            continue
+        r = r / r.max()
+        cum = np.cumsum(0.5 * (r[1:] + r[:-1]) * np.diff(wave))
+        lc = np.interp(0.5 * cum[-1], cum, 0.5 * (wave[1:] + wave[:-1]))
+        mb = re.search(r"Band\D?(\d)", os.path.basename(f))
+        b = int(mb.group(1)) if mb else int(band_of_wavelength(lc))
+        R = float(spherex_R(lc, b))
+        off = wave - lc
+        r = np.where((np.abs(off) <= 3 * lc / R) & (r >= 2e-3), r, 0.0)   # drop leaks / noise floor
+        per_band.setdefault(b, []).append((lc, off, r))
+
+    out = {}
+    for b, chans in per_band.items():
+        chans.sort(key=lambda c: c[0])
+        span = max(np.max(np.abs(c[1][c[2] > 0])) for c in chans)
+        step = min(np.median(np.diff(c[1])) for c in chans)
+        offs = np.arange(-span, span + step, step)
+        prof = np.array([np.interp(offs, c[1], c[2], left=0.0, right=0.0) for c in chans])
+        out[b] = (np.array([c[0] for c in chans]), offs, prof)
+    if not out:
+        raise ValueError(f"Could not read any fiducial response from {path}")
+    print(f" Loaded SPHEREx fiducial responses ({case}, {use_n} sub-channels) for bands "
+          f"{sorted(out)} from {path}")
+    out["_path"] = str(path)
+    return out
+
+
+def _response_weights(lam_s, lam_k, band, kernel_fwhm=1.0, table=None):
+    """T_s(lam_k) for sample wavelengths lam_s (any shape) of one band."""
+    if table is not None and band in table:
+        centres, offs, prof = table[band]
+        flat = lam_s.ravel()
+        W = np.zeros(flat.shape)
+        ok = np.isfinite(flat)
+        ch = np.clip(np.searchsorted(centres, flat[ok]), 1, len(centres) - 1)
+        ch = np.where(np.abs(flat[ok] - centres[ch - 1]) < np.abs(flat[ok] - centres[ch]), ch - 1, ch)
+        d = lam_k - flat[ok]
+        w = np.zeros(d.shape)
+        for c in np.unique(ch):
+            m = ch == c
+            w[m] = np.interp(d[m], offs, prof[c], left=0.0, right=0.0)
+        W[ok] = w
+        return W.reshape(lam_s.shape)
+    fw = kernel_fwhm * lam_s / spherex_R(lam_s, band) / _SG_EQW        # FWHM of the flat-top profile
+    with np.errstate(invalid="ignore"):
+        u = 2.0 * np.abs(lam_k - lam_s) / fw
+        return np.where(u <= 2.0, np.exp(-np.log(2) * u ** SUPERGAUSS_P), 0.0)
+
+
+def band_from_name(name, lam=None):
+    """'SPHEREx-D3' -> 3; otherwise the band containing lam."""
+    s = str(name).strip()
+    if s[-1:].isdigit():
+        return int(s[-1])
+    return band_of_wavelength(lam)
+
+
+def band_of_wavelength(lam):
+    lam = np.atleast_1d(np.asarray(lam, dtype=float))
+    out = np.full(lam.shape, -1, dtype=int)
+    for b, (lo, hi, _) in SPHEREX_BANDS.items():
+        out[(lam >= lo) & (lam < hi)] = b
+    out[lam < SPHEREX_BANDS[1][0]] = 1
+    out[lam >= SPHEREX_BANDS[6][1]] = 6
+    return out if out.size > 1 else int(out[0])
+
+
+def create_rectified_cube_kernel(
+    valid_rows, target_ra, target_dec,
+    common_waves=None,
+    master_header=None,
+    master_ny=None,
+    master_nx=None,
+    resample_method="drizzle",
+    pixfrac=0.6,
+    kernel="response",
+    kernel_fwhm=1.0,
+    min_samples=1,
+    response_file="auto",
+    fill_gaps=True,
+):
+    """
+    One epoch -> cube on the common wavelength grid by spectral kernel binning.
+
+    Each exposure is resampled onto the master RA/Dec grid (same as v1); its per-pixel
+    wavelength map is resampled too.  For node lambda_k in band b, every sample of band b
+    gets the weight K((lambda_sample - lambda_k) / (kernel_fwhm * lambda_k / R_b)) and the
+    voxel is the weighted mean.  kernel_fwhm is in units of the resolution element.
+    kernel="response" instead weights each sample by its own SPHEREx bandpass at lambda_k
+    (the SSDC R7 fiducial middle-pixel curves when response_file is given, else a flat-topped
+    model with equivalent width kernel_fwhm * lambda_s / R(lambda_s); see load_response_table).
+    Voxels with fewer than min_samples samples are NaN.
+    Same return values as create_rectified_cube.
+    """
+    if master_header is None:
+        raise ValueError("master_header must be provided; call build_master_spatial_wcs first.")
+    resp_table = None
+    if kernel == "response":
+        resp_table = resolve_response(response_file)
+        kfun, ksupp = None, 2.2
+    else:
+        kfun, ksupp = SPECTRAL_KERNELS[kernel]
+
+    waves = np.array([row["central_wavelength"] for row in valid_rows], dtype=float)
+    mjds  = np.array([row["time_bounds_lower"]  for row in valid_rows], dtype=float)
+    bands = np.array([row["band"] if "band" in valid_rows.colnames else band_of_wavelength(w)
+                      for row, w in zip(valid_rows, waves)], dtype=int)
+    bunit = valid_rows[0]["bunit"] if valid_rows[0]["bunit"] else "MJy/sr"
+    n_y, n_x = int(master_ny), int(master_nx)
+    num_slices = len(common_waves)
+
+    master_wcs = WCS(master_header).celestial
+    yy, xx = np.mgrid[0:n_y, 0:n_x]
+    sky_out = master_wcs.pixel_to_world(xx.ravel(), yy.ravel())
+
+    n_in = len(valid_rows)
+    vals = np.full((n_in, n_y, n_x), np.nan, dtype=np.float32)
+    lams = np.full((n_in, n_y, n_x), np.nan, dtype=np.float32)
+    how = f"{DRIZZLE_ENGINE}, pixfrac={pixfrac}"
+    print(f" Resampling {n_in} exposures onto master grid ({n_y}×{n_x}) with {how} …")
+    for s, row in enumerate(valid_rows):
+        wcs_in = WCS(row["hdu"].header, relax=True).celestial
+        xin, yin = wcs_in.world_to_pixel(sky_out)
+        vals[s] = drizzle_to_grid(row["hdu"].data, wcs_in, master_wcs, (n_y, n_x), pixfrac=pixfrac)
+        lams[s] = resample_to_grid(row["wave_hdu"].data, xin, yin,
+                                   method="bilinear").reshape(n_y, n_x)
+    lam_lo = np.nanmin(lams.reshape(n_in, -1), axis=1)
+    lam_hi = np.nanmax(lams.reshape(n_in, -1), axis=1)
+
+    if kernel == "response":
+        desc = (f"SSDC R7 responses: {resp_table.get('_path')}" if resp_table is not None
+                else f"flat-top bandpass, width = {kernel_fwhm} × λ/R(λ) (SSDC R7 Table 2)")
+        print(f" Response-weighted binning ({desc}) onto "
+              f"{num_slices}-node common wavelength grid …")
+    else:
+        print(f" Kernel binning ({kernel}, FWHM = {kernel_fwhm} × λ/R) onto "
+              f"{num_slices}-node common wavelength grid …")
+    cube_data = np.full((num_slices, n_y, n_x), np.nan, dtype=np.float32)
+    nsamp = np.zeros((num_slices, n_y, n_x), dtype=np.int16)
+    common_mjds = np.full(num_slices, np.nan)
+    node_band = band_of_wavelength(common_waves)
+    for k, lam_k in enumerate(common_waves):
+        b = int(node_band[k])
+        if kernel == "response":
+            if resp_table is not None and b in resp_table:
+                half = float(np.max(np.abs(resp_table[b][1][resp_table[b][2].max(axis=0) > 0])))
+            else:
+                half = 1.1 * kernel_fwhm * lam_k / float(np.min(SPHEREX_CHANNELS[b][1])) / _SG_EQW
+        else:
+            fw = kernel_fwhm * lam_k / SPHEREX_BANDS[b][2]      # kernel FWHM in um
+            half = ksupp * fw
+        cand = np.nonzero((bands == b) & (lam_lo - half <= lam_k) & (lam_hi + half >= lam_k))[0]
+        if cand.size == 0:
+            continue
+        D = vals[cand].astype(np.float64)
+        if kernel == "response":
+            W = _response_weights(lams[cand].astype(np.float64), lam_k, b,
+                                  kernel_fwhm=kernel_fwhm, table=resp_table)
+        else:
+            with np.errstate(invalid="ignore"):
+                W = kfun((lams[cand].astype(np.float64) - lam_k) / fw)
+        ok = np.isfinite(D) & np.isfinite(W)
+        W = np.where(ok, W, 0.0)
+        S0 = W.sum(axis=0)
+        cnt = (W > 0).sum(axis=0)
+        good = (S0 > 0) & (cnt >= min_samples)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            f = (W * np.where(ok, D, 0.0)).sum(axis=0) / S0
+        cube_data[k][good] = f[good]
+        nsamp[k] = cnt
+        wsum = W.reshape(cand.size, -1).sum(axis=1)
+        if wsum.sum() > 0:
+            common_mjds[k] = np.sum(wsum * mjds[cand]) / wsum.sum()
+
+    n_filled = 0
+    if fill_gaps:
+        # As in v1: each pixel's spectrum is PCHIP-interpolated across wavelengths where it has
+        # no samples (saturated star cores, flagged pixels).  Filled voxels keep NSAMP = 0, so
+        # (finite value & NSAMP == 0) marks interpolated, not measured, voxels.
+        finite = np.isfinite(cube_data)
+        need = (~finite).any(axis=0) & (finite.sum(axis=0) >= 3)
+        for yy, xx in zip(*np.nonzero(need)):
+            ok = finite[:, yy, xx]
+            f = PchipInterpolator(common_waves[ok], cube_data[ok, yy, xx].astype(float),
+                                  extrapolate=False)
+            v = f(common_waves[~ok])
+            cube_data[~ok, yy, xx] = v
+            n_filled += int(np.isfinite(v).sum())
+        print(f" Spectral gap filling (PCHIP, as v1): {n_filled} voxels "
+              f"({100 * n_filled / cube_data.size:.2f}%) interpolated; NSAMP = 0 marks them.")
+
+    out_header = master_header.copy()
+    out_header["BUNIT"]   = bunit
+    out_header["WCSAXES"] = 3
+    out_header["NAXIS"]   = 3
+    out_header["NAXIS3"]  = num_slices
+    out_header["CTYPE3"]  = "WAVE"
+    out_header["CRPIX3"]  = 1.0
+    out_header["CRVAL3"]  = float(common_waves[0])
+    out_header["CDELT3"]  = float(common_waves[1] - common_waves[0])
+    out_header["CUNIT3"]  = "um"
+    out_header["RESAMPLE"] = (resample_method, "spatial resampling method")
+    if resample_method == "drizzle":
+        out_header["PIXFRAC"] = (float(pixfrac), "drizzle drop size (input pixels)")
+        out_header["DRZENGIN"] = (DRIZZLE_ENGINE, "spatial resampling engine")
+    out_header["SPECMETH"] = ("kernel", "spectral binning (v2)")
+    out_header["KERNEL"]   = (kernel, "spectral kernel")
+    out_header["KFWHM"]    = (float(kernel_fwhm), "kernel FWHM in units of lambda/R")
+    out_header["GAPFILL"]  = (bool(fill_gaps), "spectral PCHIP fill of empty voxels (v1-like)")
+    out_header["NFILLED"]  = (int(n_filled), "voxels filled by interpolation (NSAMP=0)")
+    if kernel == "response":
+        out_header["RESPONSE"] = (("r7_table2" if "Table 2" in str(resp_table.get("_path")) else "r7_csv")
+                                  if resp_table is not None else "supergauss",
+                                  "bandpass model (SSDC R7 / Hui+2026)")
+        rpath = (resp_table.get("_path") if isinstance(resp_table, dict) else None)
+        if rpath:
+            out_header["RESPFILE"] = (os.path.basename(str(rpath))[:60], "response table")
+    return cube_data, out_header, common_waves, common_mjds, nsamp
 
 
 # -------------------------------------------------
@@ -762,7 +1221,19 @@ def make_datacubes(
     require_good_astrometry=True,
     bad_flags=DEFAULT_BAD_FLAGS,
     pixfrac=0.6,
+    spectral_method="kernel",
+    kernel="response",
+    kernel_fwhm=1.0,
+    min_samples=1,
+    response_file="auto",
+    fill_gaps=True,
 ):
+    """spectral_method: "kernel" (v2: per-epoch kernel binning on the common grid) or
+    "pchip" (v1: per-pixel PCHIP interpolation).  kernel: "response" (default; SSDC R7 SPHEREx
+    bandpass weighting, response_file="auto" finds the R7 delivery or falls back to the built-in
+    R7 model) or "tent" (triangle of FWHM kernel_fwhm * lambda/R);
+    kernel_fwhm in units of the resolution element lambda/R.  The common grid is uniform
+    with step = median exposure spacing / wave_oversample (wave_oversample > 1 subsamples)."""
     ra  = ra  * u.deg if not isinstance(ra,  u.Quantity) else ra
     dec = dec * u.deg if not isinstance(dec, u.Quantity) else dec
 
@@ -773,6 +1244,9 @@ def make_datacubes(
               f"empty pixels in single exposures; use pixfrac >= "
               f"{1.2 - pixel_scale_arcsec / 6.15:.2f}.")
     bad_flag_mask = flag_bitmask(bad_flags)
+    resp_obj = None
+    if spectral_method == "kernel" and kernel == "response":
+        resp_obj = resolve_response(response_file)
 
     results      = get_data(ra, dec, size)
     center_coord = SkyCoord(ra=ra, dec=dec)
@@ -781,6 +1255,7 @@ def make_datacubes(
     table["cutout_index"]       = np.arange(1, len(table) + 1)
     table["central_wavelength"] = np.full(len(table), np.nan)
     table["finast"]             = np.full(len(table), np.nan)
+    table["band"]               = np.full(len(table), -1, dtype=int)
     table["bunit"]              = np.full(len(table), "MJy/sr", dtype=object)
     table["hdu"]                = np.full(len(table), None, dtype=object)
     table["wave_hdu"]           = np.full(len(table), None, dtype=object)
@@ -802,6 +1277,7 @@ def make_datacubes(
             idx = r["cutout_index"] - 1
             table["central_wavelength"][idx] = r["central_wavelength"]
             table["finast"][idx]             = r["finast"]
+            table["band"][idx]               = r["band"]
             table["bunit"][idx]              = r.get("bunit", "MJy/sr")
             table["hdu"][idx]                = r["hdu"]
             table["wave_hdu"][idx]           = r["wave_hdu"]
@@ -882,23 +1358,33 @@ def make_datacubes(
         print(f"\n--- Epoch {ep}: building cube on master grid "
               f"({len(ep_rows)} cutouts) ---")
 
-        e_data, e_head, _, e_mjds = create_rectified_cube(
-            ep_rows,
-            center_coord.ra,
-            center_coord.dec,
-            common_waves=common_waves,
-            master_header=master_header,
-            master_ny=master_ny,
-            master_nx=master_nx,
-            resample_method=resample_method,
-            pixfrac=pixfrac,
-        )
+        e_nsamp = None
+        if spectral_method == "kernel":
+            e_data, e_head, _, e_mjds, e_nsamp = create_rectified_cube_kernel(
+                ep_rows, center_coord.ra, center_coord.dec, common_waves=common_waves,
+                master_header=master_header, master_ny=master_ny, master_nx=master_nx,
+                resample_method=resample_method, pixfrac=pixfrac,
+                kernel=kernel, kernel_fwhm=kernel_fwhm, min_samples=min_samples,
+                response_file=resp_obj, fill_gaps=fill_gaps)
+        else:
+            e_data, e_head, _, e_mjds = create_rectified_cube(
+                ep_rows,
+                center_coord.ra,
+                center_coord.dec,
+                common_waves=common_waves,
+                master_header=master_header,
+                master_ny=master_ny,
+                master_nx=master_nx,
+                resample_method=resample_method,
+                pixfrac=pixfrac,
+            )
 
         ep_cube = f"spherex_cube_{target}_epoch{ep}.fits"
-        fits.HDUList([
-            fits.PrimaryHDU(data=e_data,  header=e_head),
-            fits.ImageHDU(data=e_mjds,    name="MJD"),
-        ]).writeto(ep_cube, overwrite=True)
+        hdus = [fits.PrimaryHDU(data=e_data, header=e_head),
+                fits.ImageHDU(data=e_mjds, name="MJD")]
+        if e_nsamp is not None:
+            hdus.append(fits.ImageHDU(data=e_nsamp, name="NSAMP"))
+        fits.HDUList(hdus).writeto(ep_cube, overwrite=True)
         created_cubes.append((ep_cube, f"Epoch {ep}"))
         print(f" Epoch {ep} cube written: {ep_cube}  shape={e_data.shape}")
 
@@ -936,22 +1422,30 @@ def make_datacubes(
     else:
         print(f"\n[WARNING] Only {len(epoch_cube_data)} epoch(s) available — "
               f"skipping median stack (need ≥{min_epochs_for_stack}).")
-        print(" Falling back to single-epoch PCHIP cube …")
+        print(" Falling back to a single cube from all exposures …")
         valid_comb = valid.copy()
         valid_comb.sort("central_wavelength")
         if require_good_astrometry:
             valid_comb = drop_poor_astrometry(valid_comb, label="All cutouts")
-        cube_data, cube_header, _, comb_mjds = create_rectified_cube(
-            valid_comb,
-            center_coord.ra,
-            center_coord.dec,
-            common_waves=common_waves,
-            master_header=master_header,
-            master_ny=master_ny,
-            master_nx=master_nx,
-            resample_method=resample_method,
-            pixfrac=pixfrac,
-        )
+        if spectral_method == "kernel":
+            cube_data, cube_header, _, comb_mjds, _ = create_rectified_cube_kernel(
+                valid_comb, center_coord.ra, center_coord.dec, common_waves=common_waves,
+                master_header=master_header, master_ny=master_ny, master_nx=master_nx,
+                resample_method=resample_method, pixfrac=pixfrac,
+                kernel=kernel, kernel_fwhm=kernel_fwhm, min_samples=min_samples,
+                response_file=resp_obj, fill_gaps=fill_gaps)
+        else:
+            cube_data, cube_header, _, comb_mjds = create_rectified_cube(
+                valid_comb,
+                center_coord.ra,
+                center_coord.dec,
+                common_waves=common_waves,
+                master_header=master_header,
+                master_ny=master_ny,
+                master_nx=master_nx,
+                resample_method=resample_method,
+                pixfrac=pixfrac,
+            )
         combined_cube = f"spherex_cube_{target}_combined.fits"
         fits.HDUList([
             fits.PrimaryHDU(data=cube_data, header=cube_header),
@@ -963,10 +1457,173 @@ def make_datacubes(
     return created_cubes
 
 
+# -------------------------------------------------
+# Spectral extraction helpers (v2.1)
+# -------------------------------------------------
+# 1. Recentring: the aperture is centred on the source as SPHEREx sees it (flux-weighted
+#    centroid on the wavelength-median image), not on the input coordinates, which can be
+#    several arcsec off (proper motion, catalogue epoch, blended pairs).
+# 2. Aperture correction (OFF by default; aperture_correct=True to use): the fraction of a point source's light inside the aperture is
+#    measured at every wavelength from isolated field stars in the cube (curve of growth out
+#    to APCORR_REF_PIX); the aperture flux is divided by it.  Small apertures then give
+#    total fluxes with less background noise.
+# 3. Background: the annulus is sigma-clipped and other sources in it are masked.
+APCORR_REF_PIX = 3.0          # reference radius (pixels, 18.5") treated as the total for point sources
+APCORR_SMOOTH = 9             # running median over wavelength nodes for the correction
+
+
+def _median_image(data_cube):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanmedian(np.asarray(data_cube, float), axis=0)
+
+
+def _local_peaks(img, edge=8, min_sep=4):
+    """Bright, isolated local maxima of an image (x, y, peak S/N), brightest first."""
+    from scipy import ndimage
+    f = np.nan_to_num(img, nan=np.nanmedian(img))
+    smooth = ndimage.median_filter(f, 9)
+    resid = f - smooth
+    noise = 1.4826 * np.nanmedian(np.abs(resid - np.nanmedian(resid)))
+    peak = (f == ndimage.maximum_filter(f, 2 * min_sep + 1)) & (resid > 10 * noise)
+    ny, nx = f.shape
+    yy, xx = np.nonzero(peak)
+    keep = (xx >= edge) & (xx < nx - edge) & (yy >= edge) & (yy < ny - edge)
+    xx, yy = xx[keep], yy[keep]
+    snr = resid[yy, xx] / noise
+    order = np.argsort(-snr)
+    return xx[order], yy[order], snr[order]
+
+
+def find_source_centroid(data_cube, wcs, skycoord, search_arcsec=12.0, min_snr=5.0):
+    """Centroid of the source nearest the input position on the wavelength-median image.
+    Returns (SkyCoord, offset_arcsec); the input position if no clear source is found."""
+    img = _median_image(data_cube)
+    pix = float(np.mean(proj_plane_pixel_scales(wcs)) * 3600.0)
+    x0, y0 = [float(v) for v in wcs.world_to_pixel(skycoord)]
+    ny, nx = img.shape
+    yy, xx = np.mgrid[:ny, :nx]
+    rr = np.hypot(xx - x0, yy - y0)
+    rs = search_arcsec / pix
+    ring = (rr > rs + 2) & (rr < rs + 5)
+    if not np.isfinite(img[rr <= rs]).any() or not ring.any():
+        return skycoord, 0.0
+    bg = np.nanmedian(img[ring])
+    noise = 1.4826 * np.nanmedian(np.abs(img[ring] - bg))
+    sub = np.where(rr <= rs, np.nan_to_num(img - bg), -np.inf)
+    iy, ix = np.unravel_index(np.argmax(sub), sub.shape)
+    if not (noise > 0 and sub[iy, ix] > min_snr * noise):
+        return skycoord, 0.0
+    w = np.clip(np.nan_to_num(img - bg), 0, None) * (np.hypot(xx - ix, yy - iy) <= 1.5)
+    cx, cy = (w * xx).sum() / w.sum(), (w * yy).sum() / w.sum()
+    new = wcs.pixel_to_world(cx, cy)
+    return new, float(skycoord.separation(new).arcsec)
+
+
+def source_mask(img, exclude_xy=None, exclude_r=0.0, nsig=5.0, grow=2):
+    """True where other sources sit (to be left out of the background annulus)."""
+    from scipy import ndimage
+    f = np.nan_to_num(img, nan=np.nanmedian(img))
+    resid = f - ndimage.median_filter(f, 9)
+    noise = 1.4826 * np.nanmedian(np.abs(resid - np.nanmedian(resid)))
+    m = ndimage.binary_dilation(resid > nsig * noise, iterations=grow)
+    if exclude_xy is not None and exclude_r > 0:
+        yy, xx = np.mgrid[:f.shape[0], :f.shape[1]]
+        m &= np.hypot(xx - exclude_xy[0], yy - exclude_xy[1]) > exclude_r
+    return m
+
+
+def aperture_correction(data_cube, r_ap_pix, avoid_xy=None, ref_pix=APCORR_REF_PIX,
+                        max_stars=30, smooth=APCORR_SMOOTH, self_snr_min=30.0):
+    """
+    Per-wavelength point-source aperture correction (>= 1) from field stars in the cube:
+    1 / median over stars of F(r_ap) / F(ref_pix), local background in a masked annulus
+    (ref_pix+1 .. ref_pix+3 pixels), smoothed along wavelength.  Returns (corr, source),
+    source = number of field stars used, or "target" when fewer than 3 field stars exist
+    (small cutouts) and the target itself is bright (S/N > self_snr_min): its own curve of
+    growth is then used, which is valid if it is an isolated point source.
+    """
+    from scipy.ndimage import median_filter
+    cube = np.asarray(data_cube, float)
+    nw, ny, nx = cube.shape
+    if r_ap_pix >= ref_pix:
+        return np.ones(nw), 0
+    img = _median_image(cube)
+    xs, ys, snr = _local_peaks(img, edge=int(ref_pix + 4), min_sep=int(ref_pix))
+    if avoid_xy is not None:
+        far = np.hypot(xs - avoid_xy[0], ys - avoid_xy[1]) > ref_pix + 3
+        xs, ys, snr = xs[far], ys[far], snr[far]
+    # drop stars with blank pixels in their core (saturated / masked) in many slices
+    ok = [np.isnan(cube[:, y - 1:y + 2, x - 1:x + 2]).mean() < 0.05 for x, y in zip(xs, ys)]
+    xs, ys = xs[np.array(ok, bool)][:max_stars], ys[np.array(ok, bool)][:max_stars]
+    source = len(xs)
+    if len(xs) < 3:
+        if avoid_xy is None:
+            print(f"[WARNING] Aperture correction: only {len(xs)} usable field stars, not applied.")
+            return np.ones(nw), 0
+        tx, ty = int(round(avoid_xy[0])), int(round(avoid_xy[1]))
+        f = np.nan_to_num(img, nan=np.nanmedian(img))
+        yy0, xx0 = np.mgrid[:ny, :nx]
+        ring = (np.hypot(xx0 - tx, yy0 - ty) > ref_pix + 1) & (np.hypot(xx0 - tx, yy0 - ty) < ref_pix + 4)
+        noise = 1.4826 * np.nanmedian(np.abs(f[ring] - np.nanmedian(f[ring])))
+        tsnr = (f[ty, tx] - np.nanmedian(f[ring])) / noise if noise > 0 else 0
+        inside = (ref_pix + 3 <= tx < nx - ref_pix - 3) and (ref_pix + 3 <= ty < ny - ref_pix - 3)
+        print(f"[INFO] Target peak S/N on the median image: {tsnr:.0f}")
+        if tsnr < self_snr_min or not inside:
+            print(f"[WARNING] Aperture correction: only {len(xs)} usable field stars and the target "
+                  f"is too faint or too near the edge for its own curve of growth; not applied.")
+            return np.ones(nw), 0
+        print(f"[INFO] Aperture correction from the target's own curve of growth "
+              f"(only {len(xs)} field stars in this cutout; assumes an isolated point source).")
+        xs, ys, source = np.array([tx]), np.array([ty]), "target"
+    srcmask = source_mask(img)
+    yy, xx = np.mgrid[:ny, :nx]
+    fr = np.full((len(xs), nw), np.nan)
+    bgimg = np.nanmedian(img)
+    for j, (x, y) in enumerate(zip(xs, ys)):
+        # sub-pixel centroid of the star (the aperture fraction is very sensitive to centring)
+        wgt = np.clip(np.nan_to_num(img - bgimg), 0, None) * (np.hypot(xx - x, yy - y) <= 1.5)
+        xc, yc = (wgt * xx).sum() / wgt.sum(), (wgt * yy).sum() / wgt.sum()
+        rr = np.hypot(xx - x, yy - y)
+        cy0, cy1, cx0, cx1 = y - int(ref_pix) - 4, y + int(ref_pix) + 5, x - int(ref_pix) - 4, x + int(ref_pix) + 5
+        stamp = cube[:, cy0:cy1, cx0:cx1]
+        r = rr[cy0:cy1, cx0:cx1]
+        ann = (r >= ref_pix + 1) & (r <= ref_pix + 3) & ~srcmask[cy0:cy1, cx0:cx1]
+        cx_, cy_ = xc - cx0, yc - cy0
+        ap_s = CircularAperture((cx_, cy_), r=r_ap_pix)
+        ap_r = CircularAperture((cx_, cy_), r=ref_pix)
+        for k in range(nw):
+            sl = stamp[k]
+            if not np.isfinite(sl[r <= ref_pix]).all():
+                continue
+            bg = np.nanmedian(sl[ann])
+            fs = aperture_photometry(sl - bg, ap_s)["aperture_sum"][0]
+            fref = aperture_photometry(sl - bg, ap_r)["aperture_sum"][0]
+            if fref > 0:
+                fr[j, k] = fs / fref
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        frac = np.nanmedian(fr, axis=0)
+    good = np.isfinite(frac)
+    if good.sum() < 3:
+        return np.ones(nw), 0
+    frac = np.interp(np.arange(nw), np.nonzero(good)[0], frac[good])
+    frac = median_filter(frac, size=min(smooth, nw), mode="nearest")
+    frac = np.clip(frac, 0.2, 1.0)
+    return 1.0 / frac, source
+
+
 def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
                               aperture_arcsec=14.0, wl_plot=2.0,
-                              pixel_scale_arcsec=None):
-    """pixel_scale_arcsec=None → read the pixel scale from each cube's WCS
+                              pixel_scale_arcsec=None, recenter=True,
+                              aperture_correct=False, mask_sources=True):
+    """recenter: centre the aperture on the source centroid in the cube (within 12").
+    aperture_correct (default False = off): divide by the point-source fraction inside the aperture, measured at
+    each wavelength from field stars (curve of growth to 3 px = 18.5").  Only then does the
+    CSV get an `apcorr` column with the factor applied to the annulus-subtracted fluxes.
+    mask_sources: leave other sources out of the background annulus.
+
+    pixel_scale_arcsec=None → read the pixel scale from each cube's WCS
     (needed for the MJy/sr → mJy conversion when the output pixel scale changes).
 
     When two or more epoch cubes are given, a 'median_of_epochs' spectrum is also
@@ -990,10 +1647,34 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
     primary_wl_sel = None
     skycoord = SkyCoord(ra_deg, dec_deg, unit="deg")
 
+    # ── v2.1: recentre, aperture correction and annulus mask, from the first cube ──
+    apcorr, src_mask_img = None, None
+    with fits.open(cube_list[0][0]) as h0:
+        cube0, wcs0 = h0[0].data, WCS(h0[0].header).celestial
+        pix0 = float(np.mean(proj_plane_pixel_scales(wcs0)) * 3600.0)
+        if recenter and aperture_arcsec > 0:
+            new, off = find_source_centroid(cube0, wcs0, skycoord)
+            if off > 0:
+                print(f"[INFO] Aperture recentred on the SPHEREx centroid: {off:.1f}\" from the "
+                      f"input position (RA {new.ra.deg:.6f}, Dec {new.dec.deg:.6f}).")
+                skycoord = new
+        xy0 = [float(v) for v in wcs0.world_to_pixel(skycoord)]
+        if aperture_correct and aperture_arcsec > 0:
+            apcorr, n_st = aperture_correction(cube0, aperture_arcsec / pix0, avoid_xy=xy0)
+            if n_st == "target" or n_st >= 3:
+                src = "the target" if n_st == "target" else f"{n_st} field stars"
+                print(f"[INFO] Aperture correction from {src}: "
+                      f"{apcorr.min():.3f}-{apcorr.max():.3f} (r = {aperture_arcsec}\" vs "
+                      f"{APCORR_REF_PIX * pix0:.1f}\").")
+        if mask_sources and aperture_arcsec > 0:
+            src_mask_img = source_mask(_median_image(cube0), exclude_xy=xy0,
+                                       exclude_r=aperture_arcsec / pix0 + 1.0)
+
     colors   = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
     sigclip  = SigmaClip(sigma=3.0, maxiters=5)
     generated_csvs = []
     epoch_spectra  = []          # (wavelengths, out_data) for every "Epoch N" cube
+    all_spectra    = []          # (label, wavelengths, out_data) for every cube
 
     for idx, (cube_path, label) in enumerate(cube_list):
         hdul       = fits.open(cube_path)
@@ -1056,7 +1737,8 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
                 fluxes_med_sub.append((raw - bg_med_val * ap_area) * mjy_to_mjy_factor)
                 bg_medians.append(bg_med_val * ap_area * mjy_to_mjy_factor)
 
-                ann_stats  = ApertureStats(sl, ann_pix, sigma_clip=sigclip)
+                ann_stats  = ApertureStats(sl, ann_pix, sigma_clip=sigclip,
+                                           mask=src_mask_img)
                 bg_ann_val = ann_stats.median if np.isfinite(ann_stats.median) else 0.0
                 bg_ann_std = ann_stats.std    if np.isfinite(ann_stats.std)    else 0.0
                 bg_ann_tot = bg_ann_val * ap_area
@@ -1085,24 +1767,16 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
         bg_medians     = np.array(bg_medians,     dtype=float)
         bg_annuli      = np.array(bg_annuli,      dtype=float)
         flux_errors    = np.array(flux_errors,    dtype=float)
+        corr = (apcorr if (apcorr is not None and apcorr.size == n_waves)
+                else np.ones(n_waves))
+        fluxes_ann_sub = fluxes_ann_sub * corr
+        flux_errors    = flux_errors * corr
 
-        clean_label = label.lower().replace(" ", "_")
-        csv_name = os.path.join("spectra",
-                                f"{target}_{clean_label}_ap_{aperture_arcsec}.csv")
         out_data = np.c_[
             wavelengths, mjds, fluxes_raw, fluxes_med_sub,
             fluxes_ann_sub, bg_medians, bg_annuli, flux_errors,
         ]
-        hdr_txt = (
-            f"SPHEREx Extracted Spectrum — Target: {target} ({label})\n"
-            f"Units: mJy\n"
-            "wavelength_um,MJD,flux_raw_mJy,flux_median_sub_mJy,"
-            "flux_annulus_sub_mJy,bg_median_total_mJy,"
-            "bg_annulus_total_mJy,flux_err_mJy"
-        )
-        np.savetxt(csv_name, out_data, delimiter=",",
-                   header=hdr_txt, comments="# ")
-        generated_csvs.append(csv_name)
+        all_spectra.append((label, wavelengths, out_data))
         if label.lower().startswith("epoch"):
             epoch_spectra.append((wavelengths, out_data))
 
@@ -1120,34 +1794,49 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
             primary_wcs    = wcs
             primary_wl_sel = wavelengths[i_img]
 
-    # ── Median of the per-epoch spectra (recommended combined spectrum) ──────
-    same_grid = (len(epoch_spectra) >= 2 and all(
-        len(w) == len(epoch_spectra[0][0]) and np.allclose(w, epoch_spectra[0][0])
-        for w, _ in epoch_spectra))
-    if same_grid:
-        stack = np.array([d for _, d in epoch_spectra])          # (n_epoch, n_wave, 8)
+    # ── ONE CSV: combined cube (standard columns), every epoch, median of epoch spectra ──
+    names8 = ["MJD", "flux_raw_mJy", "flux_median_sub_mJy", "flux_annulus_sub_mJy",
+              "bg_median_total_mJy", "bg_annulus_total_mJy", "flux_err_mJy"]
+    ref_label, ref_w, ref_d = all_spectra[0]
+    table_out = {"wavelength_um": ref_w}
+    for j, nm in enumerate(names8, start=1):
+        table_out[nm] = ref_d[:, j]
+    if apcorr is not None and apcorr.size == len(ref_w) and np.any(apcorr != 1):
+        table_out["apcorr"] = apcorr        # only when aperture_correct=True
+    same = lambda w: len(w) == len(ref_w) and np.allclose(w, ref_w)
+    for label, w, d in all_spectra[1:]:
+        if not same(w):
+            print(f"[WARNING] {label}: different wavelength grid, left out of the CSV.")
+            continue
+        tag = label.lower().replace(" ", "")
+        table_out[f"{tag}_MJD"] = d[:, 1]
+        table_out[f"{tag}_flux_annulus_sub_mJy"] = d[:, 4]
+        table_out[f"{tag}_flux_err_mJy"] = d[:, 7]
+    if len(epoch_spectra) >= 2 and all(same(w) for w, _ in epoch_spectra):
+        stack = np.array([d for _, d in epoch_spectra])            # (n_epoch, n_wave, 8)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
-            med_data = np.nanmedian(stack, axis=0)
-            med_data[:, 1] = np.nanmean(stack[:, :, 1], axis=0)   # MJD: mean epoch time
+            med  = np.nanmedian(stack[:, :, 4], axis=0)
             n_ok = np.sum(np.isfinite(stack[:, :, 4]), axis=0)
-            mad  = np.nanmedian(np.abs(stack[:, :, 4] - med_data[None, :, 4]), axis=0)
+            mad  = np.nanmedian(np.abs(stack[:, :, 4] - med[None]), axis=0)
             sig  = np.fmax(np.nanmedian(stack[:, :, 7], axis=0), 1.4826 * mad)
-            med_data[:, 7] = 1.253 * sig / np.sqrt(np.maximum(n_ok, 1))
-        med_csv = os.path.join("spectra",
-                               f"{target}_median_of_epochs_ap_{aperture_arcsec}.csv")
-        np.savetxt(med_csv, med_data, delimiter=",", comments="# ", header=(
-            f"SPHEREx Extracted Spectrum — Target: {target} "
-            f"(median of {len(epoch_spectra)} epoch spectra)\n"
-            f"Units: mJy\n"
-            "wavelength_um,MJD,flux_raw_mJy,flux_median_sub_mJy,"
-            "flux_annulus_sub_mJy,bg_median_total_mJy,"
-            "bg_annulus_total_mJy,flux_err_mJy"))
-        generated_csvs.insert(0, med_csv)
-        ax1.errorbar(med_data[:, 0], med_data[:, 4], yerr=med_data[:, 7],
+        table_out["median_of_epochs_flux_mJy"] = med
+        table_out["median_of_epochs_err_mJy"] = 1.253 * sig / np.sqrt(np.maximum(n_ok, 1))
+        ax1.errorbar(ref_w, med, yerr=table_out["median_of_epochs_err_mJy"],
                      fmt="-", lw=2.0, color="black", capsize=0, zorder=5,
-                     label=f"Median of {len(epoch_spectra)} epoch spectra (recommended)")
-        print(f"Median-of-epochs spectrum written: {med_csv}")
+                     label=f"Median of {len(epoch_spectra)} epoch spectra")
+    csv_name = os.path.join("spectra", f"{target}_spectra_ap_{aperture_arcsec}.csv")
+    cols = list(table_out)
+    np.savetxt(csv_name, np.column_stack([table_out[c] for c in cols]), delimiter=",",
+               comments="# ", header=(
+                   f"SPHEREx Extracted Spectra — Target: {target} "
+                   f"(first columns: {ref_label} cube; then each epoch; then median of epoch spectra)\n"
+                   f"Units: mJy; annulus-subtracted fluxes "
+                   f"{'are aperture-corrected (apcorr)' if (apcorr is not None and np.any(apcorr != 1)) else 'are NOT aperture-corrected'}, "
+                   f"aperture centre RA {skycoord.ra.deg:.6f} Dec {skycoord.dec.deg:.6f}\n"
+                   + ",".join(cols)))
+    generated_csvs.append(csv_name)
+    print(f"Spectra CSV written: {csv_name}")
 
     ax1.set_xlabel("Wavelength (µm)")
     ax1.set_ylabel("Flux Density (mJy)")
@@ -1282,7 +1971,8 @@ def process_target(
     validate_photometry=False, gap_days=14.0, wave_oversample=1.0,
     min_cutouts_per_epoch=100, pixel_scale_arcsec=6.15,
     resample_method="drizzle", require_good_astrometry=True,
-    pixfrac=0.6,
+    pixfrac=0.6, spectral_method="kernel", kernel="response", kernel_fwhm=1.0,
+    response_file="auto", fill_gaps=True,
 ):
     print(f"\n[INFO] Processing {name} (RA={ra:.6f}, Dec={dec:.6f})")
     try:
@@ -1298,6 +1988,11 @@ def process_target(
             resample_method=resample_method,
             require_good_astrometry=require_good_astrometry,
             pixfrac=pixfrac,
+            spectral_method=spectral_method,
+            kernel=kernel,
+            kernel_fwhm=kernel_fwhm,
+            response_file=response_file,
+            fill_gaps=fill_gaps,
         )
         csv_files = plot_spectrum_from_cubes(
             created_cubes, ra, dec, aperture_arcsec=aperture_arcsec
@@ -1319,7 +2014,7 @@ def validate_radec(ra, dec):
 if __name__ == "__main__":
     while True:
         print("\n======================================")
-        print("SPHEREx 3D Datacube Builder (Common Grid + Median Stack)")
+        print("SPHEREx 3D Datacube Builder v2 (kernel binning per epoch + median stack)")
         print("======================================")
         print("  1 → CSV catalog")
         print("  2 → Manual RA/Dec [DEFAULT]")
@@ -1356,19 +2051,29 @@ if __name__ == "__main__":
             cutout_arcmin = float(input("Cutout size (arcmin) [default=15]: ").strip() or 15)
             aperture_arcsec = float(input("Aperture radius (arcsec) [default=14]: ").strip() or 14)
             gap_days = float(input("Max epoch gap (days) [default=14]: ").strip() or 14)
-            wave_oversample = float(input("Wavelength grid oversample [default=1.0]: ").strip() or 1.0)
+            wave_oversample = float(input("Wavelength grid oversample (>1 = finer uniform grid) "
+                                          "[default=1.0]: ").strip() or 1.0)
             min_cutouts_per_epoch = int(input("Keep epochs with more than N cutouts, N [default=100]: ").strip() or 100)
             pixel_scale_arcsec = float(input("Output pixel scale (arcsec) [default=6.15 = native]: ").strip() or 6.15)
-            resample_method = (input("Resampling (drizzle/lanczos3/lanczos2/cubic/bilinear/nearest) "
-                                     "[default=drizzle]: ").strip().lower() or "drizzle")
-            if resample_method not in RESAMPLE_METHODS:
-                print(f"[WARNING] Unknown method '{resample_method}', using drizzle.")
-                resample_method = "drizzle"
-            pixfrac = 0.6
-            if resample_method == "drizzle":
-                pixfrac = float(input("Drizzle pixfrac (smaller = sharper, noisier) "
-                                      "[default=0.6]: ").strip() or 0.6)
+            resample_method = "drizzle"                  # STScI drizzle
+            pixfrac = float(input("Drizzle pixfrac (smaller = sharper, noisier) "
+                                  "[default=0.6]: ").strip() or 0.6)
             cutout_size = cutout_arcmin * u.arcminute
+            spectral_method = (input("Spectral method: kernel (v2) / pchip (v1) [default=kernel]: ")
+                               .strip().lower() or "kernel")
+            kernel, kernel_fwhm, response_file = "response", 1.0, "auto"
+            if spectral_method == "kernel":
+                kernel = (input("Spectral kernel: response (SSDC R7 filter response) / tent "
+                                "[default=response]: ").strip().lower() or "response")
+                if kernel not in ("response",) + tuple(SPECTRAL_KERNELS):
+                    print(f"[WARNING] Unknown kernel '{kernel}', using response.")
+                    kernel = "response"
+                if kernel == "response":
+                    response_file = (input("SSDC R7 responses [default=auto: R7 CSV folder if present, "
+                                           "else profiles from R7 Table 2 built into this script]: ")
+                                     .strip() or "auto")
+                kernel_fwhm = float(input("Kernel FWHM in resolution elements lambda/R "
+                                          "[default=1.0]: ").strip() or 1.0)
 
             subtract_zodi = input("Subtract Zodiacal Light? (y/n) [default=y]: ").strip().lower() in ("y","yes","")
             mask_flags    = input("Mask bad-pixel FLAGS (cosmic rays, hot/cold, persistence; never SOURCE)? "
@@ -1385,6 +2090,10 @@ if __name__ == "__main__":
                 pixel_scale_arcsec=pixel_scale_arcsec,
                 resample_method=resample_method,
                 pixfrac=pixfrac,
+                spectral_method=spectral_method,
+                kernel=kernel,
+                kernel_fwhm=kernel_fwhm,
+                response_file=response_file,
             )
 
             if mode == "1":
