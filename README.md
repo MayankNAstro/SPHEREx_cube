@@ -1,4 +1,4 @@
-# SPICED— SPHEREx Interpolated Cube Extraction \& Data Pipeline
+# SPICED— SPHEREx Interpolated Cube Extraction \& Data Pipeline  — v4
  
 
 Please cite M. Narang et al., (in prep)
@@ -20,6 +20,10 @@ Image Cleaning & Masking:
 
 +++ Cosmic ray rejection via local median filtering.
 
++++ STScI drizzle package 
+
++++ Uses the official SPHEREx calibration data from https://irsa.ipac.caltech.edu/data/SPHEREx/docs/spherex_spectral_calibrations.html
+
 Aperture Photometry & Extraction: Measures target fluxes using photutils with local annulus and global median background estimation, exporting time-stamped CSV spectra and diagnostic spatial plots.
 
 Flexible Input Modes: Supports batch processing from standard CSV catalogs, manual equatorial coordinates (Decimal Degrees or HMS/DMS), direct SIMBAD name resolution, or local FITS re-analysis.
@@ -38,10 +42,6 @@ Processed outputs are automatically organized into FITS files and a local ./spec
 
 └── spectra/
 
-    ├── <target>_combined_ap_<radius>.csv   # Extracted 1D spectrum, MJDs & uncertainties
 
-    
-    └── <target>_multiepoch_cutout.png      # 1D Spectrum plot & 2D spatial aperture overlay
-    
 
     
