@@ -1,7 +1,9 @@
 # SPICED— SPHEREx Interpolated Cube Extraction \& Data Pipeline  — v4
  
 
-Please cite M. Narang et al., (in prep)
+# Please cite M. Narang et al., (in prep)
+
+# Download the SPHEREx calibration data from https://irsa.ipac.caltech.edu/data/SPHEREx/docs/spherex_spectral_calibrations.html
 
 A Python tool designed to query IRSA TAP services, download SPHEREx image cutouts across all 6 spectral bandpasses, and construct 3D spatial-spectral datacubes with optional sky subtraction and artifact filtering. It automates multi-epoch observational clustering, PCHIP spectral interpolation, and background-subtracted aperture photometry.
 
