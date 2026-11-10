@@ -1,4 +1,4 @@
-# SPICED— SPHEREx Interpolated Cube Extraction \& Data Pipeline  — v4
+# SPICED— SPHEREx Interpolated Cube Extraction \& Data Pipeline
  
 
 # Please cite M. Narang et al., (in prep)
