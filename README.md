@@ -1,7 +1,7 @@
 # SPICED— SPHEREx Interpolated Cube Extraction \& Data Pipeline
  
 
-# Please cite M. Narang et al., (in prep)
+ Please cite M. Narang et al., (in prep)
 
 # Download the SPHEREx calibration data from https://irsa.ipac.caltech.edu/data/SPHEREx/docs/spherex_spectral_calibrations.html
 
