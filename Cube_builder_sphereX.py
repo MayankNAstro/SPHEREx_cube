@@ -1,17 +1,7 @@
 ### ==============================
-# SPHEREx datacube builder — v2
-# Spatial resampling: STScI drizzle package (pip install drizzle), the AstroDrizzle engine.
-# Spectral axis: each epoch is built separately.  Every drizzled sample keeps its own
-# wavelength (pixel- and epoch-dependent) and is assigned to a uniform common wavelength
-# grid with a spectral kernel whose width follows the SPHEREx resolution element
-# lambda/R of the node's detector band (R = 41/41/41/35/110/130).  Samples within the
-# kernel are averaged.  DEFAULT kernel = "response": each sample is weighted by its own
-# SPHEREx bandpass from the SSDC R7 spectral calibration: profiles generated from Table 2 of
-# the R7 note (lambda_c, R per channel; built into this script); the R7 CSVs are used if found.
-# Alternative: tent = triangular weights of FWHM lambda/R.  Samples never
-# mix detector bands.  Epoch cubes are then median-combined as in v1.
-# One aperture CSV holds the combined cube, every epoch, and the median of the epoch spectra.
-### ==============================
+# SPHEREx datacube builder — v4
+
+
 # Core Python & Scientific Stack
 # ==============================
 import os
@@ -207,16 +197,30 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
             native_wave_map, _ = spec_wcs.pixel_to_world(x_idx, y_idx)
             native_wave_map = native_wave_map.to(u.micron).value
 
+            # R7 spectral calibration: per-pixel band centre / width from the parameter maps
+            # (verified detector coordinates), else WCS (+6.4 nm in bands 5-6)
+            band_i = band_from_name(row.get("energy_bandpassname", ""), lam)
+            native_wave_map, bw_map, lam_cal, wave_src = calibrated_wavelengths(
+                img_hdu.header, native_wave_map, band_i, x, y)
+            if lam_cal is not None:
+                lam = lam_cal
+            elif wave_src == "WCS+MWIR":
+                lam = lam + MWIR_BC_SHIFT_UM
+
             hdu = fits.ImageHDU(data=img_data, header=img_hdu.header.copy())
             hdu.header["EXTNAME"] = f"IMAGE{row['cutout_index']}"
             hdu.header["BUNIT"] = bunit
 
             wave_hdu = fits.ImageHDU(data=native_wave_map, header=img_hdu.header)
+            bw_hdu = (fits.ImageHDU(data=np.asarray(bw_map, np.float32), header=img_hdu.header)
+                      if bw_map is not None else None)
 
             return {
                 "cutout_index": row["cutout_index"],
-                "band": band_from_name(row.get("energy_bandpassname", ""), lam),
+                "band": band_i,
                 "central_wavelength": lam,
+                "wave_src": wave_src,
+                "bw_hdu": bw_hdu,
                 "time_bounds_lower": row.get("time_bounds_lower", np.nan),
                 "bunit": bunit,
                 "uri": row["uri"],
@@ -236,7 +240,9 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
             "uri": row["uri"],
             "finast": np.nan,
             "hdu": None,
-            "wave_hdu": None
+            "wave_hdu": None,
+            "wave_src": "",
+            "bw_hdu": None,
         }
 
 # -------------------------------------------------
@@ -679,20 +685,201 @@ def resolve_response(response_file):
 SSDC_R7_NAMES = ("SSDC_R7", "SSDC R7", "SSDC_R7_spectral", "SPHERExSpectralFiles", "ssdc_r7")
 
 
+def _calib_search_roots():
+    here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    home = os.path.expanduser("~")
+    bases = [os.getcwd(), here, os.path.dirname(here), os.path.dirname(os.getcwd()),
+             os.path.join(home, "Desktop"), os.path.join(home, "Downloads"), home]
+    return list(dict.fromkeys(b for b in bases if b and os.path.isdir(b)))
+
+
+# members of the delivery that the cube builder needs (fiducial curves + parameter maps)
+SSDC_TAR_MEMBERS = ("MiddlePixel/SubChannel17", "FidSpecSummary/SubChannel17", "ParameterFiles")
+
+
+def _extract_ssdc_tar(tar_path, dest_root):
+    """Unpack the parts of SPHERExSpectralFiles_*.tar the builder uses into dest_root/<tar stem>."""
+    import tarfile
+    out = os.path.join(dest_root, os.path.splitext(os.path.basename(tar_path))[0])
+    if os.path.isdir(os.path.join(out, "MiddlePixel")):
+        return out
+    print(f"[INFO] Unpacking the SPHEREx spectral calibration {tar_path} -> {out} (once) ...")
+    os.makedirs(out, exist_ok=True)
+    with tarfile.open(tar_path) as tf:
+        members = [m for m in tf.getmembers()
+                   if any(m.name.lstrip("./").startswith(p) for p in SSDC_TAR_MEMBERS)
+                   and not m.issym() and not m.islnk() and ".." not in m.name]
+        tf.extractall(out, members=members)
+    return out
+
+
 def find_ssdc_r7():
-    """Return the SSDC R7 delivery folder, or None (then the built-in R7 Table-2 model is used)."""
+    """Return the SSDC R7 spectral-calibration folder (SPHERExSpectralFiles_202607 or similar),
+    or None (then the built-in R7 Table-2 model is used).  Looked for in $SPHEREX_SSDC_R7, the
+    working directory, this script's folder, their parents, ~/Desktop, ~/Downloads and ~; a
+    SPHERExSpectralFiles_*.tar found there is unpacked (needed members only) next to this script."""
     import glob
     env = os.environ.get("SPHEREX_SSDC_R7")
-    roots = [env] if env else []
-    here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
-    for base in dict.fromkeys([os.getcwd(), here]):
-        roots += [os.path.join(base, n) for n in SSDC_R7_NAMES]
-        roots += glob.glob(os.path.join(base, "*", "MiddlePixel", ".."))
-    for r in roots:
+    cands = [env] if env else []
+    tars = []
+    for base in _calib_search_roots():
+        cands += [os.path.join(base, n) for n in SSDC_R7_NAMES]
+        cands += sorted(glob.glob(os.path.join(base, "SPHERExSpectralFiles*")))
+        cands += sorted(glob.glob(os.path.join(base, "*", "SPHERExSpectralFiles*")))
+        cands += glob.glob(os.path.join(base, "*", "MiddlePixel", ".."))
+    for r in cands:
+        if r and r.endswith(".tar") and os.path.isfile(r):
+            tars.append(r)
+            continue
         if r and os.path.isdir(r) and glob.glob(os.path.join(r, "**", "FiducialSpec*.csv"),
                                                 recursive=True):
             return os.path.normpath(r)
+    if env and env.endswith(".tar") and os.path.isfile(env):
+        tars.insert(0, env)
+    if tars:
+        here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+        try:
+            return _extract_ssdc_tar(sorted(tars)[-1], here)
+        except Exception as e:
+            print(f"[WARNING] Could not unpack {tars[-1]}: {e}")
     return None
+
+
+# ---- per-pixel calibration: band-centre (BC) and band-width (BW) maps ----
+USE_BC_MAPS = True            # per-pixel wavelengths / bandwidths from the R7 parameter maps
+APPLY_MWIR_SHIFT = True       # if the maps cannot be used: R7 band-centre correction of the
+MWIR_BC_SHIFT_UM = 0.0064     # WCS wavelengths in bands 5-6 (+6.4 nm, R7 delivery note Sect. 4)
+BC_MATCH_TOL_UM = 0.02        # map vs WCS: |median difference| allowed when validating the
+BC_MATCH_SCATTER_UM = 0.004   # detector coordinates, and the allowed robust scatter
+_PARAM_MAPS = {}
+
+
+def load_param_map(kind, band, root=None):
+    """R7 parameter map ('BC' band centre or 'BW' band width, um) of detector `band`, 2040x2040,
+    or None when the delivery / file is not available.  Cached."""
+    import glob
+    key = (kind, int(band))
+    if key in _PARAM_MAPS:
+        return _PARAM_MAPS[key]
+    root = root or find_ssdc_r7()
+    arr = None
+    if root:
+        f = sorted(glob.glob(os.path.join(root, "**", f"*SSDC_{kind}_Band{int(band)}.fits"),
+                             recursive=True))
+        if not f:   # maps may sit in another copy of the delivery (e.g. only one has ParameterFiles)
+            for base in _calib_search_roots():
+                f = sorted(glob.glob(os.path.join(base, "*SPHERExSpectralFiles*", "**",
+                                                  f"*SSDC_{kind}_Band{int(band)}.fits"), recursive=True)
+                           + glob.glob(os.path.join(base, "*", "*SPHERExSpectralFiles*", "**",
+                                                    f"*SSDC_{kind}_Band{int(band)}.fits"), recursive=True))
+                if f:
+                    break
+        if f:
+            with fits.open(f[0]) as h:
+                d = next(x.data for x in h if x.data is not None and np.ndim(x.data) == 2)
+            arr = np.asarray(d, dtype=np.float32)
+            if np.nanmedian(arr) > 100:                     # nm -> um
+                arr = arr / 1000.0
+    _PARAM_MAPS[key] = arr
+    return arr
+
+
+def detector_coords(header, shape, wave_map, band):
+    """Detector pixel coordinates (X, Y), 0-based, of every pixel of a cutout, VERIFIED against
+    the image's spectral WCS: the R7 band-centre map sampled there must agree with the WCS
+    wavelengths (median offset < BC_MATCH_TOL_UM, robust scatter < BC_MATCH_SCATTER_UM).
+    Candidates: the alternate WCS 'A' (parent-image pixel coordinates of IRSA cutouts, 0- or
+    1-based), IRAF LTV1/LTV2 offsets, and the image itself if it is a full 2040x2040 frame.
+    Returns (X, Y, median offset BC - WCS) or None."""
+    bc = load_param_map("BC", band)
+    if bc is None or wave_map is None:
+        return None
+    ny, nx = shape
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(float)
+    cands = []
+    try:
+        if "CTYPE1A" in header:
+            wa = WCS(header, key="A", relax=True)
+            if not wa.has_celestial and wa.naxis >= 2:
+                X, Y = wa.sub(2).wcs_pix2world(xx, yy, 0)
+                cands += [("WCS-A", X, Y), ("WCS-A-1", X - 1.0, Y - 1.0)]
+    except Exception:
+        pass
+    if "LTV1" in header and "LTV2" in header:
+        cands.append(("LTV", xx - float(header["LTV1"]), yy - float(header["LTV2"])))
+    if (ny, nx) == bc.shape:
+        cands.append(("full-frame", xx, yy))
+    best = None
+    sub = (slice(None, None, max(1, ny // 12)), slice(None, None, max(1, nx // 12)))
+    for name, X, Y in list(cands) + [(n + "-T", Yc, Xc) for n, Xc, Yc in cands]:
+        Xi, Yi = np.rint(X).astype(int), np.rint(Y).astype(int)
+        if Xi.min() < 0 or Yi.min() < 0 or Xi.max() >= bc.shape[1] or Yi.max() >= bc.shape[0]:
+            continue
+        d = (bc[Yi[sub], Xi[sub]] - wave_map[sub]).ravel()
+        d = d[np.isfinite(d)]
+        if d.size < 10:
+            continue
+        med = float(np.median(d))
+        sc = float(1.4826 * np.median(np.abs(d - med)))
+        if abs(med) < BC_MATCH_TOL_UM and sc < BC_MATCH_SCATTER_UM and (best is None or sc < best[3]):
+            best = (name, X, Y, sc, med)
+    if best is None:
+        return None
+    return best[1], best[2], best[4]
+
+
+def _bilinear(img, X, Y):
+    x0 = np.clip(np.floor(X).astype(int), 0, img.shape[1] - 2)
+    y0 = np.clip(np.floor(Y).astype(int), 0, img.shape[0] - 2)
+    fx, fy = X - x0, Y - y0
+    return ((1 - fx) * (1 - fy) * img[y0, x0] + fx * (1 - fy) * img[y0, x0 + 1]
+            + (1 - fx) * fy * img[y0 + 1, x0] + fx * fy * img[y0 + 1, x0 + 1])
+
+
+def calibrated_wavelengths(header, wave_map, band, x_src=None, y_src=None):
+    """Per-pixel central wavelength and bandwidth maps of one exposure with the R7 calibration.
+    Returns (wave_map, bw_map or None, lam_at_source or None, how) where how is
+    'BCmap' (parameter maps at verified detector coordinates), 'WCS+MWIR' (WCS wavelengths with
+    the +6.4 nm band 5-6 correction) or 'WCS'."""
+    if USE_BC_MAPS and band in range(1, 7):
+        dc = detector_coords(header, wave_map.shape, wave_map, band)
+        if dc is not None:
+            X, Y, _ = dc
+            bc, bw = load_param_map("BC", band), load_param_map("BW", band)
+            wmap = _bilinear(bc, X, Y)
+            bmap = _bilinear(bw, X, Y) if bw is not None else None
+            lam_src = None
+            if x_src is not None:
+                lam_src = float(_bilinear(wmap, np.atleast_1d(float(x_src)), np.atleast_1d(float(y_src)))[0])
+            return wmap, bmap, lam_src, "BCmap"
+    if APPLY_MWIR_SHIFT and band in (5, 6):
+        return wave_map + MWIR_BC_SHIFT_UM, None, None, "WCS+MWIR"
+    return wave_map, None, None, "WCS"
+
+
+def check_calibration(l2_path_or_url, x=None, y=None):
+    """Diagnostic for one SPHEREx L2 image or cutout: which wavelength source the builder would
+    use (BC maps or WCS), the map-vs-WCS offset, and the wavelength at (x, y)."""
+    with fits.open(l2_path_or_url) as hdul:
+        h = hdul["IMAGE"].header
+        det = str(h.get("DETECTOR", h.get("BAND", "")))
+        band = int(det[-1]) if det[-1:].isdigit() else None
+        ny, nx = hdul["IMAGE"].data.shape
+        sw = WCS(h, fobj=hdul, key="W", relax=True)
+        sw.sip = None
+        yy, xx = np.indices((ny, nx))
+        wl = sw.pixel_to_world(xx, yy)[0].to(u.micron).value
+    if band in (None, -1):
+        band = int(band_of_wavelength(np.nanmedian(wl)))
+    dc = detector_coords(h, (ny, nx), wl, band)
+    print(f"band {band}: WCS wavelengths {np.nanmin(wl):.4f}-{np.nanmax(wl):.4f} um")
+    print(f"  R7 calibration folder: {find_ssdc_r7()}")
+    if dc is None:
+        print("  detector coordinates NOT verified -> WCS wavelengths"
+              + (f" + {MWIR_BC_SHIFT_UM * 1e3:.1f} nm (bands 5-6)" if band in (5, 6) and APPLY_MWIR_SHIFT else ""))
+    else:
+        print(f"  BC maps used; median BC - WCS = {dc[2] * 1e3:+.2f} nm")
+    return dc
 
 
 def load_response_table(path):
@@ -838,8 +1025,20 @@ def _load_response_dir(path, nsub=17, case="Cent"):
     return out
 
 
-def _response_weights(lam_s, lam_k, band, kernel_fwhm=1.0, table=None):
-    """T_s(lam_k) for sample wavelengths lam_s (any shape) of one band."""
+def _channel_eqw(table, band):
+    """Equivalent width (integral of the peak-normalised curve) of each channel's response."""
+    key = ("_eqw", band)
+    if key not in table:
+        centres, offs, prof = table[band]
+        trap = getattr(np, "trapezoid", None) or np.trapz
+        table[key] = trap(prof, offs, axis=1)
+    return table[key]
+
+
+def _response_weights(lam_s, lam_k, band, kernel_fwhm=1.0, table=None, bw_s=None):
+    """T_s(lam_k) for sample wavelengths lam_s (any shape) of one band.  bw_s (same shape, um):
+    the samples' own bandwidths from the R7 BW map; the channel curve is then stretched in
+    wavelength so its equivalent width equals bw_s (shape from the fiducial curve)."""
     if table is not None and band in table:
         centres, offs, prof = table[band]
         flat = lam_s.ravel()
@@ -848,6 +1047,11 @@ def _response_weights(lam_s, lam_k, band, kernel_fwhm=1.0, table=None):
         ch = np.clip(np.searchsorted(centres, flat[ok]), 1, len(centres) - 1)
         ch = np.where(np.abs(flat[ok] - centres[ch - 1]) < np.abs(flat[ok] - centres[ch]), ch - 1, ch)
         d = lam_k - flat[ok]
+        if bw_s is not None:
+            bw = np.asarray(bw_s, float).ravel()[ok]
+            eqw = _channel_eqw(table, band)[ch]
+            scale = np.where(np.isfinite(bw) & (bw > 0), eqw / bw, 1.0)
+            d = d * scale
         w = np.zeros(d.shape)
         for c in np.unique(ch):
             m = ch == c
@@ -929,6 +1133,8 @@ def create_rectified_cube_kernel(
     n_in = len(valid_rows)
     vals = np.full((n_in, n_y, n_x), np.nan, dtype=np.float32)
     lams = np.full((n_in, n_y, n_x), np.nan, dtype=np.float32)
+    have_bw = "bw_hdu" in valid_rows.colnames and any(r["bw_hdu"] is not None for r in valid_rows)
+    bws = np.full((n_in, n_y, n_x), np.nan, dtype=np.float32) if have_bw else None
     how = f"{DRIZZLE_ENGINE}, pixfrac={pixfrac}"
     print(f" Resampling {n_in} exposures onto master grid ({n_y}×{n_x}) with {how} …")
     for s, row in enumerate(valid_rows):
@@ -937,6 +1143,9 @@ def create_rectified_cube_kernel(
         vals[s] = drizzle_to_grid(row["hdu"].data, wcs_in, master_wcs, (n_y, n_x), pixfrac=pixfrac)
         lams[s] = resample_to_grid(row["wave_hdu"].data, xin, yin,
                                    method="bilinear").reshape(n_y, n_x)
+        if have_bw and row["bw_hdu"] is not None:
+            bws[s] = resample_to_grid(row["bw_hdu"].data, xin, yin,
+                                      method="bilinear").reshape(n_y, n_x)
     lam_lo = np.nanmin(lams.reshape(n_in, -1), axis=1)
     lam_hi = np.nanmax(lams.reshape(n_in, -1), axis=1)
 
@@ -956,7 +1165,7 @@ def create_rectified_cube_kernel(
         b = int(node_band[k])
         if kernel == "response":
             if resp_table is not None and b in resp_table:
-                half = float(np.max(np.abs(resp_table[b][1][resp_table[b][2].max(axis=0) > 0])))
+                half = 1.15 * float(np.max(np.abs(resp_table[b][1][resp_table[b][2].max(axis=0) > 0])))
             else:
                 half = 1.1 * kernel_fwhm * lam_k / float(np.min(SPHEREX_CHANNELS[b][1])) / _SG_EQW
         else:
@@ -968,7 +1177,8 @@ def create_rectified_cube_kernel(
         D = vals[cand].astype(np.float64)
         if kernel == "response":
             W = _response_weights(lams[cand].astype(np.float64), lam_k, b,
-                                  kernel_fwhm=kernel_fwhm, table=resp_table)
+                                  kernel_fwhm=kernel_fwhm, table=resp_table,
+                                  bw_s=(bws[cand].astype(np.float64) if have_bw else None))
         else:
             with np.errstate(invalid="ignore"):
                 W = kfun((lams[cand].astype(np.float64) - lam_k) / fw)
@@ -1021,8 +1231,13 @@ def create_rectified_cube_kernel(
     out_header["KFWHM"]    = (float(kernel_fwhm), "kernel FWHM in units of lambda/R")
     out_header["GAPFILL"]  = (bool(fill_gaps), "spectral PCHIP fill of empty voxels (v1-like)")
     out_header["NFILLED"]  = (int(n_filled), "voxels filled by interpolation (NSAMP=0)")
+    srcs = sorted({str(r["wave_src"]) for r in valid_rows}) if "wave_src" in valid_rows.colnames else ["WCS"]
+    out_header["WAVESRC"] = ("+".join(srcs)[:60], "pixel wavelengths: BCmap (R7 maps) / WCS(+MWIR)")
+    out_header["MWIRSHFT"] = (float(MWIR_BC_SHIFT_UM if "WCS+MWIR" in srcs else 0.0),
+                              "um added to WCS wavelengths of bands 5-6")
+    out_header["BWMAP"] = (bool(have_bw), "per-pixel bandwidth from the R7 BW map")
     if kernel == "response":
-        out_header["RESPONSE"] = (("r7_table2" if "Table 2" in str(resp_table.get("_path")) else "r7_csv")
+        out_header["RESPONSE"] = (("r7_table2" if "Table 2" in str(resp_table.get("_path")) else "ssdc_r7_cent")
                                   if resp_table is not None else "supergauss",
                                   "bandpass model (SSDC R7 / Hui+2026)")
         rpath = (resp_table.get("_path") if isinstance(resp_table, dict) else None)
@@ -1259,6 +1474,8 @@ def make_datacubes(
     table["bunit"]              = np.full(len(table), "MJy/sr", dtype=object)
     table["hdu"]                = np.full(len(table), None, dtype=object)
     table["wave_hdu"]           = np.full(len(table), None, dtype=object)
+    table["bw_hdu"]             = np.full(len(table), None, dtype=object)
+    table["wave_src"]           = np.full(len(table), "", dtype=object)
 
     print(" Downloading cutouts …")
     t_start = time.time()
@@ -1281,6 +1498,8 @@ def make_datacubes(
             table["bunit"][idx]              = r.get("bunit", "MJy/sr")
             table["hdu"][idx]                = r["hdu"]
             table["wave_hdu"][idx]           = r["wave_hdu"]
+            table["bw_hdu"][idx]             = r.get("bw_hdu")
+            table["wave_src"][idx]           = r.get("wave_src", "")
             table["time_bounds_lower"][idx]  = r["time_bounds_lower"]
             table["uri"][idx]                = r["uri"]
             if i % 10 == 0 or i == len(table):
@@ -1290,6 +1509,10 @@ def make_datacubes(
     valid = table[~np.isnan(table["central_wavelength"])]
     if len(valid) == 0:
         raise RuntimeError("No valid cutouts retrieved.")
+    srcs, nsrc = np.unique(np.asarray(valid["wave_src"], dtype=str), return_counts=True)
+    print("[INFO] Wavelength calibration of the exposures: "
+          + ", ".join(f"{s or '?'} x{n}" for s, n in zip(srcs, nsrc))
+          + "  (BCmap = R7 band-centre/width maps; WCS+MWIR = WCS + 6.4 nm in bands 5-6)")
 
     valid = assign_epochs_clustered(valid, max_gap_days=gap_days)
     plot_epoch_distribution(valid, target)
