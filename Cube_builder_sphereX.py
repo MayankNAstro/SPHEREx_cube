@@ -1,7 +1,25 @@
 ### ==============================
-# SPHEREx datacube builder — v4
-
-
+# SPHEREx datacube builder — v2
+# Spatial resampling: STScI drizzle package (pip install drizzle), the AstroDrizzle engine.
+# Spectral axis: each epoch is built separately.  Every drizzled sample keeps its own
+# wavelength (pixel- and epoch-dependent) and is assigned to a uniform common wavelength
+# grid with a spectral kernel whose width follows the SPHEREx resolution element
+# lambda/R of the node's detector band (R = 41/41/41/35/110/130).  Samples within the
+# kernel are averaged.  DEFAULT kernel = "response": each sample is weighted by its own
+# SPHEREx bandpass from the SSDC R7 spectral calibration: profiles generated from Table 2 of
+# the R7 note (lambda_c, R per channel; built into this script); the R7 CSVs are used if found.
+# SPECTRAL CALIBRATION (SSDC R7, July 2026; Hui et al. 2026): when the delivery
+# SPHERExSpectralFiles_202607 (folder or .tar) is found, (1) the response weights use the
+# MEASURED middle-pixel (Cent) curves, (2) each pixel's central wavelength and bandwidth come
+# from the band-centre / band-width maps (ParameterFiles/*_BC_/BW_Band<b>.fits) instead of the
+# image's spectral WCS, when the cutout's detector pixel coordinates can be found and verified,
+# and (3) otherwise the WCS wavelengths of bands 5-6 get the R7 +6.4 nm MWIR band-centre
+# correction.  Header keywords RESPONSE, WAVESRC, MWIRSHFT record what was used.
+# Alternative: tent = triangular weights of FWHM lambda/R.  Samples never
+# mix detector bands.  Epoch cubes are then median-combined as in v1.
+# One aperture CSV holds every epoch and the median of the epoch spectra (the combined cube
+# is used for the image and aperture centring only; its spectrum is not extracted).
+### ==============================
 # Core Python & Scientific Stack
 # ==============================
 import os
@@ -90,6 +108,39 @@ DEFAULT_BAD_FLAGS = (
 )
 
 
+# A bright star's own core is often flagged SUR_ERROR (the up-the-ramp fit of a saturating
+# pixel), TRANSIENT (its ramp looks like a cosmic-ray jump) or PERSIST (SPHEREx's small steps
+# put the star on its own afterimage).  Masking those pixels punches a hole in the star in
+# some exposures and makes the spectrum jump: on FZ Tau, keeping them cut the scatter between
+# exposures at the same wavelength from 28 % to 10 % in band 4 and from 21 % to 16 % in band 3.
+# With PROTECT_STAR_CORES, a pixel whose only bad flags are these "soft" ones is kept when it
+# is also flagged as a star (SOURCE / OVERFLOW / NONLINEAR).
+SOFT_FLAGS = ("TRANSIENT", "PERSIST", "SUR_ERROR")
+# Saturation masking (prompt "Mask saturated pixels", process_target(mask_saturated=...)):
+#   "overflow"  (default) mask fully saturated pixels (FLAGS OVERFLOW)
+#   "nonlinear" also mask NONLINEAR pixels (set from ~100 mJy on: removes most bright cores)
+#   "none"      keep everything (smooth, but bright stars come out low where they saturate)
+# Masking avoids the clipping bias but leaves the core missing in some exposures (holes/jumps).
+SATURATION_MASKS = {"none": (), "overflow": ("OVERFLOW",), "nonlinear": ("OVERFLOW", "NONLINEAR")}
+SATURATED_FLAGS = SATURATION_MASKS["overflow"]
+
+
+def saturation_flags(mask_saturated):
+    """Flags to mask for a mask_saturated setting ("none"/"overflow"/"nonlinear"; True/False
+    are accepted as "overflow"/"none")."""
+    if mask_saturated is True:
+        mask_saturated = "overflow"
+    elif mask_saturated is False or mask_saturated is None:
+        mask_saturated = "none"
+    key = str(mask_saturated).strip().lower()
+    if key not in SATURATION_MASKS:
+        raise ValueError(f"mask_saturated must be one of {list(SATURATION_MASKS)}")
+    return SATURATION_MASKS[key]
+STAR_FLAGS = ("SOURCE", "OVERFLOW", "NONLINEAR")
+PROTECT_STAR_CORES = True
+CORE_DIAG_RADIUS_PIX = 1.5    # target-core radius (native px) for the flag diagnostic
+
+
 def flag_bitmask(names=DEFAULT_BAD_FLAGS):
     mask = 0
     for name in names:
@@ -159,12 +210,27 @@ def get_data(ra, dec, size):
 # -------------------------------------------------
 # Cutout processing (ZODI subtraction, FLAGS masking, astrometry quality)
 # -------------------------------------------------
+def _cutout_filename(row):
+    """Local file name of a downloaded cutout: <cutout_index>_<original L2 file name>."""
+    base = os.path.basename(str(row["uri"]).split("?")[0]) or "cutout.fits"
+    if not base.lower().endswith((".fits", ".fits.gz")):
+        base += ".fits"
+    return f"{int(row['cutout_index']):04d}_{base}"
+
+
 def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
-                          bad_flag_mask=None):
+                          bad_flag_mask=None, psf_stamp=True, save_dir=None):
     if bad_flag_mask is None:
         bad_flag_mask = flag_bitmask()
     try:
         with open_fits_with_retry(row["uri"]) as hdul:
+            if save_dir:                       # untouched copy of the downloaded cutout
+                try:
+                    out = os.path.join(save_dir, _cutout_filename(row))
+                    if not os.path.exists(out):
+                        hdul.writeto(out, overwrite=True, output_verify="silentfix")
+                except Exception as e_sv:
+                    print(f" Could not save cutout {row['cutout_index']}: {e_sv}")
             img_hdu = hdul["IMAGE"]
             wcs = WCS(img_hdu.header, relax=True)
 
@@ -174,9 +240,17 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
                 zodi_data = hdul["ZODI"].data.astype(np.float64)
                 img_data -= zodi_data
 
+            flags_data, bad_pix = None, None
             if mask_flags and "FLAGS" in hdul and hdul["FLAGS"].data is not None:
                 flags_data = hdul["FLAGS"].data.astype(np.int64)
-                img_data[(flags_data & bad_flag_mask) != 0] = np.nan
+                bad_pix = (flags_data & bad_flag_mask) != 0
+                if PROTECT_STAR_CORES:
+                    soft = flag_bitmask(SOFT_FLAGS) & bad_flag_mask
+                    hard = bad_flag_mask & ~soft
+                    soft_only = ((flags_data & soft) != 0) & ((flags_data & hard) == 0)
+                    star = (flags_data & flag_bitmask(STAR_FLAGS)) != 0
+                    bad_pix &= ~(soft_only & star)
+                img_data[bad_pix] = np.nan
 
             bunit = img_hdu.header.get("BUNIT", "MJy/sr").strip()
 
@@ -186,6 +260,17 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
 
             coord = SkyCoord(ra=ra, dec=dec)
             x, y = wcs.world_to_pixel(coord)
+
+            # diagnostic: which flags sit on the target's core, and is the core still masked
+            core_flags, core_masked = "", False
+            if flags_data is not None and np.isfinite(x) and np.isfinite(y):
+                yy, xx = np.ogrid[:flags_data.shape[0], :flags_data.shape[1]]
+                near = np.hypot(xx - float(x), yy - float(y)) <= CORE_DIAG_RADIUS_PIX
+                if near.any():
+                    fl = np.bitwise_or.reduce(flags_data[near])
+                    core_flags = "|".join(k for k, b in SPHEREX_FLAG_BITS.items()
+                                          if fl >> b & 1 and k != "SOURCE")
+                    core_masked = bool(bad_pix[near].any())
 
             spec_wcs = WCS(img_hdu.header, fobj=hdul, key="W", relax=True)
             spec_wcs.sip = None
@@ -200,6 +285,7 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
             # R7 spectral calibration: per-pixel band centre / width from the parameter maps
             # (verified detector coordinates), else WCS (+6.4 nm in bands 5-6)
             band_i = band_from_name(row.get("energy_bandpassname", ""), lam)
+            wcs_wave_map = native_wave_map
             native_wave_map, bw_map, lam_cal, wave_src = calibrated_wavelengths(
                 img_hdu.header, native_wave_map, band_i, x, y)
             if lam_cal is not None:
@@ -215,6 +301,14 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
             bw_hdu = (fits.ImageHDU(data=np.asarray(bw_map, np.float32), header=img_hdu.header)
                       if bw_map is not None else None)
 
+            stamp = None
+            if psf_stamp:
+                try:
+                    stamp = make_psf_stamp(hdul, img_data, wcs, float(x), float(y),
+                                           band=band_i, wave_map=wcs_wave_map, bw_map=bw_map)
+                except Exception as e_st:
+                    print(f" PSF stamp failed for cutout {row['cutout_index']}: {e_st}")
+
             return {
                 "cutout_index": row["cutout_index"],
                 "band": band_i,
@@ -226,7 +320,10 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
                 "uri": row["uri"],
                 "finast": finast,
                 "hdu": hdu,
-                "wave_hdu": wave_hdu
+                "wave_hdu": wave_hdu,
+                "psf_stamp": stamp,
+                "core_flags": core_flags,
+                "core_masked": core_masked,
             }
 
     except Exception as e:
@@ -243,6 +340,9 @@ def process_cutout_return(row, ra, dec, subtract_zodi=True, mask_flags=True,
             "wave_hdu": None,
             "wave_src": "",
             "bw_hdu": None,
+            "psf_stamp": None,
+            "core_flags": "",
+            "core_masked": False,
         }
 
 # -------------------------------------------------
@@ -1422,6 +1522,43 @@ def drop_poor_astrometry(rows, label=""):
 # -------------------------------------------------
 # Main Datacube Builder
 # -------------------------------------------------
+def _report_core_flags(epoch_row_lists):
+    """Print which FLAGS hit the target's core in the exposures used for the cubes."""
+    from collections import Counter
+    for ep_rows in epoch_row_lists:
+        if "core_flags" not in ep_rows.colnames:
+            return
+        cnt = Counter()
+        for f in ep_rows["core_flags"]:
+            cnt.update([x for x in str(f).split("|") if x])
+        n, nm = len(ep_rows), int(np.sum(ep_rows["core_masked"]))
+        top = ", ".join(f"{k} {v}" for k, v in cnt.most_common(6)) or "none"
+        print(f"[INFO] Epoch {ep_rows['epoch'][0]}: target-core flags in {n} exposures: {top}; "
+              f"core still masked in {nm} exposure(s)"
+              + (" (star-core protection on)" if PROTECT_STAR_CORES else ""))
+
+
+def _write_cutout_index(valid, epoch_row_lists, save_dir, target):
+    """CSV next to the saved cutouts: one row per cutout with band, wavelength, time, epoch and
+    whether it went into the cubes (epoch kept and astrometry OK)."""
+    used = set()
+    for ep_rows in epoch_row_lists:
+        used.update(int(i) for i in ep_rows["cutout_index"])
+    lines = ["file,cutout_index,band,central_wavelength_um,mjd,epoch,used_in_cube,core_flags,core_masked"]
+    for r in valid:
+        ci = int(r["cutout_index"])
+        lines.append(",".join(str(v) for v in (
+            _cutout_filename(r), ci, r["band"] if "band" in valid.colnames else "",
+            f"{float(r['central_wavelength']):.5f}", f"{float(r['time_bounds_lower']):.5f}",
+            r["epoch"], ci in used,
+            r["core_flags"] if "core_flags" in valid.colnames else "",
+            r["core_masked"] if "core_masked" in valid.colnames else "")))
+    path = os.path.join(save_dir, f"{str(target).replace(' ', '_')}_cutout_index.csv")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[INFO] Cutout index written: {path}")
+
+
 def make_datacubes(
     ra, dec, size, target,
     color_by_wavelength=False,
@@ -1442,6 +1579,9 @@ def make_datacubes(
     min_samples=1,
     response_file="auto",
     fill_gaps=True,
+    psf_stamps=True,
+    return_rows=False,
+    save_images=False,
 ):
     """spectral_method: "kernel" (v2: per-epoch kernel binning on the common grid) or
     "pchip" (v1: per-pixel PCHIP interpolation).  kernel: "response" (default; SSDC R7 SPHEREx
@@ -1459,6 +1599,9 @@ def make_datacubes(
               f"empty pixels in single exposures; use pixfrac >= "
               f"{1.2 - pixel_scale_arcsec / 6.15:.2f}.")
     bad_flag_mask = flag_bitmask(bad_flags)
+    sat_masked = [f for f in ("OVERFLOW", "NONLINEAR") if f in bad_flags]
+    print("[INFO] Saturation flags masked: " + ("/".join(sat_masked) if sat_masked
+                                                 else "none (saturated pixels kept)"))
     resp_obj = None
     if spectral_method == "kernel" and kernel == "response":
         resp_obj = resolve_response(response_file)
@@ -1476,16 +1619,24 @@ def make_datacubes(
     table["wave_hdu"]           = np.full(len(table), None, dtype=object)
     table["bw_hdu"]             = np.full(len(table), None, dtype=object)
     table["wave_src"]           = np.full(len(table), "", dtype=object)
+    table["psf_stamp"]          = np.full(len(table), None, dtype=object)
+    table["core_flags"]         = np.full(len(table), "", dtype=object)
+    table["core_masked"]        = np.zeros(len(table), dtype=bool)
 
     print(" Downloading cutouts …")
     t_start = time.time()
 
+    save_dir = None
+    if save_images:
+        save_dir = os.path.join("spherex_cutouts", str(target).replace(" ", "_"))
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"[INFO] Downloaded cutouts will be saved to {save_dir}/")
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {
             executor.submit(
                 process_cutout_return, row, ra, dec,
                 subtract_zodi=subtract_zodi, mask_flags=mask_flags,
-                bad_flag_mask=bad_flag_mask,
+                bad_flag_mask=bad_flag_mask, psf_stamp=psf_stamps, save_dir=save_dir,
             ): i
             for i, row in enumerate(table)
         }
@@ -1500,6 +1651,9 @@ def make_datacubes(
             table["wave_hdu"][idx]           = r["wave_hdu"]
             table["bw_hdu"][idx]             = r.get("bw_hdu")
             table["wave_src"][idx]           = r.get("wave_src", "")
+            table["psf_stamp"][idx]          = r.get("psf_stamp")
+            table["core_flags"][idx]         = r.get("core_flags", "")
+            table["core_masked"][idx]        = r.get("core_masked", False)
             table["time_bounds_lower"][idx]  = r["time_bounds_lower"]
             table["uri"][idx]                = r["uri"]
             if i % 10 == 0 or i == len(table):
@@ -1557,6 +1711,11 @@ def make_datacubes(
         epoch_row_lists = kept
         if not epoch_row_lists:
             raise RuntimeError("No epochs left after the astrometry cut.")
+
+    if save_images:
+        _write_cutout_index(valid, epoch_row_lists, save_dir, target)
+
+    _report_core_flags(epoch_row_lists)
 
     # ── Step 2: ONE common wavelength grid across all qualifying epochs ────
     common_waves = build_common_wave_grid(epoch_row_lists,
@@ -1677,6 +1836,8 @@ def make_datacubes(
         created_cubes.insert(0, (combined_cube, "Combined"))
         print(f" Combined Datacube written: {combined_cube}")
 
+    if return_rows:
+        return created_cubes, epoch_row_lists
     return created_cubes
 
 
@@ -1719,7 +1880,8 @@ def _local_peaks(img, edge=8, min_sep=4):
 
 
 def find_source_centroid(data_cube, wcs, skycoord, search_arcsec=12.0, min_snr=5.0):
-    """Centroid of the source nearest the input position on the wavelength-median image.
+    """Centroid of the significant peak (local maximum, S/N > min_snr) nearest the input position
+    within search_arcsec, on the wavelength-median image.
     Returns (SkyCoord, offset_arcsec); the input position if no clear source is found."""
     img = _median_image(data_cube)
     pix = float(np.mean(proj_plane_pixel_scales(wcs)) * 3600.0)
@@ -1734,9 +1896,17 @@ def find_source_centroid(data_cube, wcs, skycoord, search_arcsec=12.0, min_snr=5
     bg = np.nanmedian(img[ring])
     noise = 1.4826 * np.nanmedian(np.abs(img[ring] - bg))
     sub = np.where(rr <= rs, np.nan_to_num(img - bg), -np.inf)
-    iy, ix = np.unravel_index(np.argmax(sub), sub.shape)
-    if not (noise > 0 and sub[iy, ix] > min_snr * noise):
+    # significant local maxima inside the search radius; take the one NEAREST the input
+    # position (not the brightest: in clusters the brightest is often a neighbour)
+    from scipy.ndimage import maximum_filter
+    peaks = (sub == maximum_filter(sub, size=3)) & np.isfinite(sub) & (rr <= rs)
+    if noise > 0:
+        peaks &= sub > min_snr * noise
+    if not peaks.any():
         return skycoord, 0.0
+    py, px = np.nonzero(peaks)
+    k = int(np.argmin(np.hypot(px - x0, py - y0)))
+    iy, ix = py[k], px[k]
     w = np.clip(np.nan_to_num(img - bg), 0, None) * (np.hypot(xx - ix, yy - iy) <= 1.5)
     cx, cy = (w * xx).sum() / w.sum(), (w * yy).sum() / w.sum()
     new = wcs.pixel_to_world(cx, cy)
@@ -1836,11 +2006,523 @@ def aperture_correction(data_cube, r_ap_pix, avoid_xy=None, ref_pix=APCORR_REF_P
     return 1.0 / frac, source
 
 
+# -------------------------------------------------
+# PSF-fitting spectrophotometry on the native L2 exposures (v2.2)
+# -------------------------------------------------
+# Every exposure is fitted on its own native 6.15" pixels (no resampling) with the PSF that the
+# SSDC ships inside each Level-2 file for the source's detector zone:
+#   * pipeline >= 7.0: 'EPSF' binary table, 21x21 zones, columns XCENTER/YCENTER/EPSF, OVSMPX/Y=5
+#   * older files    : 'PSF' image cube, 11x11 zones (121 planes), OVERSAMP=10.  The plane is
+#     taken from the detector position as iplane = iy*11 + ix (row-major, x fastest), which is the
+#     real cube order; the XCTR_*/YCTR_* header keys of pipeline 6.4-6.5.5 files describe it
+#     transposed (IRSA "PSF Extension Header Error"), so they are not used.
+# The fit is forced at the source position (refined once from the bright exposures), with
+# known neighbours fitted simultaneously, a local background from a sigma-clipped annulus, and
+# VARIANCE weights.  Saturated / non-linear pixels (FLAGS OVERFLOW, NONLINEAR) are left out of
+# the fit, so the flux of bright stars comes from the unsaturated wings of the PSF.  For every
+# exposure the number of such pixels inside the photometric aperture is recorded: it is the
+# per-channel saturation diagnostic written to the PSF CSV.
+PSF_FIT_RADIUS_PIX = 3.0      # native pixels used in the fit around the target (18.5")
+PSF_BG_ANNULUS_PIX = (4.5, 7.5)
+PSF_STAMP_HALF     = 9        # stamp = 19 x 19 native pixels kept per exposure
+PSF_SAT_FLAGS      = ("OVERFLOW",)   # counted for the diagnostic; by default NOT left out of
+                                   # the fit (exclude_saturated=False): on FZ Tau keeping them gave
+                                   # the lower scatter (wings-only fits were worse)
+PSF_MAX_CORE_LOST  = 0.95     # reject an exposure if > 95 % of the target's PSF flux is masked
+PSF_NEIGHBOUR_ARCSEC = 45.0   # neighbours this close to the target are fitted simultaneously
+PSF_FREE_POS_SNR   = 100.0    # exposures above this S/N get a free sub-pixel position (astrometric jitter)
+PSF_NATIVE_ZONES   = 11       # old PSF cube: 11 x 11 zones over the 2040 x 2040 detector
+L2_NPIX            = 2040
+
+
+def _parent_pixel(header, x, y, wave_map=None, band=None):
+    """Detector (parent L2 image) pixel, 0-based, of cutout pixel (x, y).  Tries the verified
+    detector_coords() mapping first, then CRPIX1A/2A (IRSA cutout convention), then LTV1/2."""
+    try:
+        if wave_map is not None and band in range(1, 7):
+            dc = detector_coords(header, wave_map.shape, wave_map, band)
+            if dc is not None:
+                X, Y, _ = dc
+                xi = int(np.clip(np.rint(x), 0, X.shape[1] - 1))
+                yi = int(np.clip(np.rint(y), 0, X.shape[0] - 1))
+                return float(X[yi, xi] + (x - xi)), float(Y[yi, xi] + (y - yi)), "verified"
+    except Exception:
+        pass
+    if "CRPIX1A" in header and "CRPIX2A" in header:
+        return (float(x) + 1.0 - float(header["CRPIX1A"]) - 1.0 + float(header.get("CRVAL1A", 1.0)),
+                float(y) + 1.0 - float(header["CRPIX2A"]) - 1.0 + float(header.get("CRVAL2A", 1.0)),
+                "CRPIX-A")
+    if "LTV1" in header and "LTV2" in header:
+        return float(x) - float(header["LTV1"]), float(y) - float(header["LTV2"]), "LTV"
+    ny, nx = header.get("NAXIS2", 0), header.get("NAXIS1", 0)
+    if (ny, nx) == (L2_NPIX, L2_NPIX):
+        return float(x), float(y), "full-frame"
+    return None, None, "unknown"
+
+
+def load_l2_psf(hdul, xdet, ydet):
+    """PSF for detector position (xdet, ydet) (0-based; None = detector centre) from an L2 file
+    or cutout.  Returns (psf_2d normalised to sum 1 in oversampled pixels, ovx, ovy, tag)."""
+    if xdet is None or not np.isfinite(xdet):
+        xdet = ydet = (L2_NPIX - 1) / 2.0
+    if "EPSF" in hdul and hdul["EPSF"].data is not None:
+        h = hdul["EPSF"]
+        tab = h.data
+        xc = np.asarray(tab["XCENTER"], float)
+        yc = np.asarray(tab["YCENTER"], float)
+        i = int(np.argmin((xc - (xdet + 1.0)) ** 2 + (yc - (ydet + 1.0)) ** 2))
+        psf = np.asarray(tab["EPSF"][i], float)
+        ovx = int(h.header.get("OVSMPX", 5)); ovy = int(h.header.get("OVSMPY", ovx))
+        tag = f"EPSF[{i}]"
+    elif "PSF" in hdul and hdul["PSF"].data is not None:
+        h = hdul["PSF"]
+        cube = np.asarray(h.data, float)
+        ov = int(h.header.get("OVERSAMP", 10)); ovx = ovy = ov
+        if cube.ndim == 2:
+            psf, tag = cube, "PSF"
+        else:
+            n = int(round(np.sqrt(cube.shape[0])))
+            zw = L2_NPIX / n
+            ix = int(np.clip(xdet // zw, 0, n - 1)); iy = int(np.clip(ydet // zw, 0, n - 1))
+            k = iy * n + ix                      # row-major: the real plane order
+            psf, tag = cube[k], f"PSF[{k + 1}]"
+    else:
+        return None, None, None, "none"
+    psf = np.nan_to_num(psf, nan=0.0)
+    s = psf.sum()
+    if not (s > 0):
+        return None, None, None, "none"
+    return psf / s, ovx, ovy, tag
+
+
+def render_psf(psf, ovx, ovy, shape, xs, ys):
+    """Unit-flux PSF on native pixel grid `shape`, source at (xs, ys) (0-based pixel centres).
+    The (effective) PSF is sampled at native pixel centres, as for photutils ImagePSF, with its
+    centre at the middle of the oversampled array; the result is normalised to sum 1 over the
+    full PSF footprint (so flux lost off the stamp edge is not mistaken for a smaller star)."""
+    from scipy.ndimage import map_coordinates
+    cy, cx = (psf.shape[0] - 1) / 2.0, (psf.shape[1] - 1) / 2.0
+    ny, nx = shape
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(float)
+    m = map_coordinates(psf, [cy + (yy - ys) * ovy, cx + (xx - xs) * ovx],
+                        order=3, mode="constant", cval=0.0, prefilter=True)
+    # normalisation over the whole footprint at the same sub-pixel phase
+    hy, hx = int(np.ceil(psf.shape[0] / (2 * ovy))) + 1, int(np.ceil(psf.shape[1] / (2 * ovx))) + 1
+    fy, fx = ys - np.floor(ys), xs - np.floor(xs)
+    gy, gx = np.mgrid[-hy:hy + 1, -hx:hx + 1].astype(float)
+    full = map_coordinates(psf, [cy + (gy - fy) * ovy, cx + (gx - fx) * ovx],
+                           order=3, mode="constant", cval=0.0, prefilter=True)
+    tot = full.sum()
+    return m / tot if tot > 0 else m
+
+
+def _local_pixel_sr(wcs, x, y):
+    """Solid angle (sr) of the native pixel at (x, y), from the local WCS Jacobian (incl. SIP)."""
+    try:
+        p = wcs.pixel_to_world([x - 0.5, x + 0.5, x - 0.5], [y - 0.5, y - 0.5, y + 0.5])
+        a = p[0].spherical_offsets_to(p[1]); b = p[0].spherical_offsets_to(p[2])
+        ax, ay = a[0].to(u.rad).value, a[1].to(u.rad).value
+        bx, by = b[0].to(u.rad).value, b[1].to(u.rad).value
+        return float(abs(ax * by - ay * bx))
+    except Exception:
+        return float(((6.15 * u.arcsec).to(u.rad).value) ** 2)
+
+
+def make_psf_stamp(hdul, img_data, wcs, x, y, band=None, wave_map=None, bw_map=None):
+    """Small native-pixel stamp around (x, y) with everything the PSF fit needs.  img_data is the
+    IMAGE already zodi-subtracted and with the bad FLAGS set to NaN.  Returns a dict or None."""
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return None
+    ny, nx = img_data.shape
+    xi, yi = int(np.rint(x)), int(np.rint(y))
+    h = PSF_STAMP_HALF
+    y0, y1, x0, x1 = yi - h, yi + h + 1, xi - h, xi + h + 1
+    if x1 <= 0 or y1 <= 0 or x0 >= nx or y0 >= ny:
+        return None
+
+    def cut(a, fill):
+        out = np.full((2 * h + 1, 2 * h + 1), fill, dtype=np.asarray(a).dtype if fill != fill else float)
+        sy0, sx0 = max(y0, 0), max(x0, 0)
+        sy1, sx1 = min(y1, ny), min(x1, nx)
+        out[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = a[sy0:sy1, sx0:sx1]
+        return out
+
+    img = cut(np.asarray(img_data, float), np.nan)
+    if "VARIANCE" in hdul and hdul["VARIANCE"].data is not None:
+        var = cut(np.asarray(hdul["VARIANCE"].data, float), np.nan)
+    else:
+        var = np.full(img.shape, np.nan)
+    sat = np.zeros(img.shape, bool)
+    if "FLAGS" in hdul and hdul["FLAGS"].data is not None:
+        fl = np.asarray(hdul["FLAGS"].data).astype(np.int64)
+        sat = (cut(fl, 0).astype(np.int64) & flag_bitmask(PSF_SAT_FLAGS)) != 0
+    xdet, ydet, how = _parent_pixel(hdul["IMAGE"].header, x, y, wave_map, band)
+    psf, ovx, ovy, tag = load_l2_psf(hdul, xdet, ydet)
+    if psf is None:
+        return None
+    bw = np.nan
+    if bw_map is not None:
+        try:
+            bw = float(_bilinear(np.asarray(bw_map, float), np.atleast_1d(float(x)),
+                                 np.atleast_1d(float(y)))[0])
+        except Exception:
+            pass
+    return dict(img=img.astype(np.float32), var=var.astype(np.float32), sat=sat,
+                ox=x0, oy=y0, xs=float(x - x0), ys=float(y - y0), wcs=wcs,
+                psf=psf.astype(np.float32), ovx=ovx, ovy=ovy, psf_tag=tag, det_how=how,
+                xdet=xdet, ydet=ydet, pix_sr=_local_pixel_sr(wcs, x, y), bw=bw)
+
+
+def psf_fit_stamp(st, sky_positions, ap_radius_arcsec=14.0, fit_radius=PSF_FIT_RADIUS_PIX,
+                  exclude_saturated=True, fit_offset=False, max_shift=1.0):
+    """Forced PSF fit of one stamp.  sky_positions: [target, neighbour, ...] SkyCoords.
+    Returns a dict: flux_mJy, err_mJy (target), chi2r, npix, n_sat_ap, n_sat_fit, core_lost,
+    bg; with fit_offset=True also the best-fit target shift (dx, dy) in native pixels."""
+    img, var, sat = st["img"].astype(float), st["var"].astype(float), st["sat"]
+    shape = img.shape
+    yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+    pos = []
+    for c in sky_positions:
+        px, py = st["wcs"].world_to_pixel(c)
+        pos.append((float(px) - st["ox"], float(py) - st["oy"]))
+    xt, yt = pos[0]
+    rr = np.hypot(xx - xt, yy - yt)
+    pix_arcsec = np.sqrt(st["pix_sr"]) * 206264.806
+    r_ap = ap_radius_arcsec / pix_arcsec
+    out = dict(flux_mJy=np.nan, err_mJy=np.nan, chi2r=np.nan, npix=0,
+               n_sat_ap=int((sat & (rr <= r_ap)).sum()),
+               n_sat_fit=int((sat & (rr <= fit_radius)).sum()),
+               core_lost=np.nan, bg=np.nan, dx=0.0, dy=0.0)
+    if not (0 <= xt < shape[1] and 0 <= yt < shape[0]):
+        return out
+
+    # local background: sigma-clipped annulus, away from neighbours and saturated pixels
+    ann = (rr >= PSF_BG_ANNULUS_PIX[0]) & (rr <= PSF_BG_ANNULUS_PIX[1]) & np.isfinite(img) & ~sat
+    for (xn, yn) in pos[1:]:
+        ann &= np.hypot(xx - xn, yy - yn) > 2.5
+    if ann.sum() >= 8:
+        _, bg, _ = sigma_clipped_stats(img[ann], sigma=3.0, maxiters=5)
+    else:
+        bg = 0.0
+    out["bg"] = float(bg)
+    data = img - bg
+
+    good = np.isfinite(data)
+    if np.isfinite(var).any():
+        vfill = np.nanmedian(var[np.isfinite(var) & (var > 0)]) if (np.isfinite(var) & (var > 0)).any() else 1.0
+        var = np.where(np.isfinite(var) & (var > 0), var, vfill)
+    else:
+        noise = 1.4826 * np.nanmedian(np.abs(data[ann] - np.nanmedian(data[ann]))) if ann.any() else 1.0
+        var = np.full(shape, max(noise, 1e-6) ** 2)
+    use = good & (rr <= fit_radius)
+    if exclude_saturated:
+        use &= ~sat
+
+    def solve(comps):
+        A = np.column_stack([c[use] for c in comps])
+        w = 1.0 / np.sqrt(var[use])
+        Aw, bw_ = A * w[:, None], data[use] * w
+        coef, *_ = np.linalg.lstsq(Aw, bw_, rcond=None)
+        resid = bw_ - Aw @ coef
+        dof = max(use.sum() - len(comps), 1)
+        return coef, resid, dof, Aw
+
+    if use.sum() < 6:
+        return out
+    psf_f = st["psf"].astype(float)
+    # sources that reach the fit region (target always)
+    active = [0] + [i for i in range(1, len(pos))
+                    if render_psf(psf_f, st["ovx"], st["ovy"], shape, *pos[i])[use].sum() > 0.02]
+
+    def design(sh):
+        return [render_psf(psf_f, st["ovx"], st["ovy"], shape,
+                           pos[i][0] + sh[2 * j], pos[i][1] + sh[2 * j + 1])
+                for j, i in enumerate(active)]
+
+    sh = np.zeros(2 * len(active))
+    if fit_offset:                       # free sub-pixel shift of every active source
+        from scipy.optimize import least_squares
+        try:
+            res = least_squares(lambda p: solve(design(p))[1], sh,
+                                bounds=(-max_shift, max_shift), x_scale=0.2)
+            sh = res.x
+        except Exception:
+            pass
+    comps = design(sh)
+    coef, resid, dof, Aw = solve(comps)
+    chi2r = float(np.sum(resid ** 2) / dof)
+    try:
+        cov = np.linalg.inv(Aw.T @ Aw)
+        err = float(np.sqrt(cov[0, 0] * max(chi2r, 1.0)))
+    except np.linalg.LinAlgError:
+        err = np.nan
+    pt = comps[0]
+    inner = rr <= fit_radius
+    core_lost = 1.0 - pt[use].sum() / pt[inner].sum() if pt[inner].sum() > 0 else np.nan
+    out["shifts"] = {i: (float(sh[2 * j]), float(sh[2 * j + 1])) for j, i in enumerate(active)}
+    dx, dy = out["shifts"][0]
+    k = st["pix_sr"] * 1e9                           # MJy/sr summed over pixels -> mJy
+    out.update(flux_mJy=float(coef[0] * k), err_mJy=float(err * k), chi2r=chi2r,
+               npix=int(use.sum()), core_lost=float(core_lost), dx=dx, dy=dy)
+    return out
+
+
+def _find_neighbours(cube_path, target_coord, max_sep_arcsec=PSF_NEIGHBOUR_ARCSEC,
+                     min_sep_arcsec=8.0, min_rel=0.02, max_n=6):
+    """Point sources near the target on the wavelength-median image of a cube (SkyCoords)."""
+    with fits.open(cube_path) as h:
+        img = _median_image(h[0].data)
+        wcs = WCS(h[0].header).celestial
+    xs, ys, snr = _local_peaks(img, edge=1, min_sep=1)
+    if len(xs) == 0:
+        return []
+    sky = wcs.pixel_to_world(xs, ys)
+    sep = target_coord.separation(sky).arcsec
+    xt, yt = [float(v) for v in wcs.world_to_pixel(target_coord)]
+    bg = np.nanmedian(img)
+    tpk = np.nanmax(img[max(int(yt) - 1, 0):int(yt) + 2, max(int(xt) - 1, 0):int(xt) + 2]) - bg
+    keep = (sep > min_sep_arcsec) & (sep < max_sep_arcsec) & ((img[ys, xs] - bg) > min_rel * tpk)
+    idx = np.nonzero(keep)[0][:max_n]
+    out = []
+    for i in idx:                                     # sub-pixel flux-weighted centroid
+        x0, y0 = int(xs[i]), int(ys[i])
+        sl = (slice(max(y0 - 1, 0), y0 + 2), slice(max(x0 - 1, 0), x0 + 2))
+        w = np.clip(np.nan_to_num(img[sl] - bg), 0, None)
+        gy, gx = np.mgrid[sl]
+        if w.sum() > 0:
+            out.append(wcs.pixel_to_world((w * gx).sum() / w.sum(), (w * gy).sum() / w.sum()))
+        else:
+            out.append(sky[i])
+    return out
+
+
+def _wmean_clip(f, e, W, nsig=4.0):
+    """Kernel- and inverse-variance-weighted mean of samples with iterative outlier clipping."""
+    ok = np.isfinite(f) & np.isfinite(e) & (e > 0) & (W > 0)
+    for _ in range(5):
+        if ok.sum() == 0:
+            return np.nan, np.nan, 0
+        w = W[ok] / e[ok] ** 2
+        o = np.argsort(f[ok]); cw = np.cumsum(W[ok][o]); med = f[ok][o][np.searchsorted(cw, cw[-1] / 2)]
+        mad = 1.4826 * np.median(np.abs(f[ok] - med))
+        lim = nsig * np.maximum(e, mad if ok.sum() >= 4 else 0)
+        new = ok & (np.abs(f - med) <= lim)
+        if new.sum() == ok.sum() or new.sum() == 0:
+            break
+        ok = new
+    w = W[ok] / e[ok] ** 2
+    mean = np.sum(w * f[ok]) / np.sum(w)
+    err = np.sqrt(np.sum(w ** 2 * e[ok] ** 2)) / np.sum(w)
+    n = int(ok.sum())
+    if n >= 3:                                        # inflate by the observed scatter
+        chi2r = np.sum(W[ok] * ((f[ok] - mean) / e[ok]) ** 2) / np.sum(W[ok]) * n / (n - 1)
+        err *= np.sqrt(max(chi2r, 1.0))
+    return float(mean), float(err), n
+
+
+def psf_spectrum(samples, waves, resp_table=None, kernel_fwhm=1.0):
+    """Spectrum on the common grid from per-exposure PSF fluxes (same R7 response weighting as
+    the cube).  Returns flux, err, n_used, n_saturated (samples with OVERFLOW/NONLINEAR pixels
+    in the aperture among those with weight > 0.1)."""
+    lam = samples["lam"].to_numpy(float); bwv = samples["bw"].to_numpy(float)
+    f = samples["flux_mJy"].to_numpy(float); e = samples["err_mJy"].to_numpy(float)
+    band = samples["band"].to_numpy(int); nsat = samples["n_sat_ap"].to_numpy(int)
+    flux = np.full(len(waves), np.nan); err = flux.copy()
+    nused = np.zeros(len(waves), int); nsatk = np.zeros(len(waves), int)
+    have_bw = np.isfinite(bwv).any()
+    for k, lk in enumerate(waves):
+        b = int(np.atleast_1d(band_of_wavelength(lk))[0])
+        cand = np.nonzero(band == b)[0]
+        if cand.size == 0:
+            continue
+        W = _response_weights(lam[cand], lk, b, kernel_fwhm=kernel_fwhm, table=resp_table,
+                              bw_s=(bwv[cand] if have_bw else None))
+        W = np.where(np.isfinite(W), W, 0.0)
+        if not (W > 0).any():
+            continue
+        flux[k], err[k], nused[k] = _wmean_clip(f[cand], e[cand], W)
+        nsatk[k] = int(((W > 0.1 * W.max()) & (nsat[cand] > 0)).sum())
+    return flux, err, nused, nsatk
+
+
+def run_psf_photometry(epoch_row_lists, created_cubes, target, ra_deg, dec_deg,
+                       aperture_arcsec=14.0, resp_table=None, kernel_fwhm=1.0,
+                       exclude_saturated=False, fit_neighbours=True, aperture_csv=None,
+                       recenter=True, recenter_max_arcsec=None):
+    """PSF spectra of the target from the per-exposure stamps.  Writes
+    spectra/<target>_psf_spectra_ap_<r>.csv (one column set per epoch, all-exposure clipped mean,
+    and median of the epoch spectra = recommended), spectra/<target>_psf_samples.csv (one row per
+    exposure) and spectra/<target>_psf_spectra.png.  Returns the spectra CSV path or None."""
+    os.makedirs("./spectra", exist_ok=True)
+    rows = []
+    for ep_rows in epoch_row_lists:
+        for r in ep_rows:
+            st = r["psf_stamp"] if "psf_stamp" in ep_rows.colnames else None
+            if st is not None:
+                rows.append((int(r["epoch"]), r, st))
+    if not rows:
+        print("[WARNING] PSF photometry: no exposure carries a PSF extension; skipped.")
+        return None
+
+    # target position: centroid on the combined/first cube, then neighbours from the same cube
+    cube0 = created_cubes[0][0]
+    target = str(target)
+    tc = SkyCoord(ra_deg, dec_deg, unit="deg")
+    if recenter:                       # same rule as the aperture: nearest peak within 6"
+        rmax = RECENTER_MAX_ARCSEC if recenter_max_arcsec is None else recenter_max_arcsec
+        with fits.open(cube0) as h:
+            new, off = find_source_centroid(h[0].data, WCS(h[0].header).celestial, tc,
+                                            search_arcsec=rmax)
+        if off <= rmax:
+            tc = new
+    neigh = _find_neighbours(cube0, tc) if fit_neighbours else []
+    if neigh:
+        print(f"[INFO] PSF fit: {len(neigh)} neighbour(s) fitted simultaneously at "
+              + ", ".join(f"{tc.separation(n).arcsec:.0f}\"" for n in neigh))
+
+    # pass 1: free sub-pixel shifts of target and neighbours on the brightest exposures
+    #         (saturated ones included: their cores are masked) -> one sky offset per source
+    srcs = [tc] + neigh
+    first = []
+    for ep, r, st in rows:
+        res = psf_fit_stamp(st, srcs, aperture_arcsec, exclude_saturated=exclude_saturated)
+        snr = res["flux_mJy"] / res["err_mJy"] if res["err_mJy"] > 0 else 0
+        if np.isfinite(snr) and snr > 30 and res["core_lost"] <= 0.9:
+            first.append((snr, st))
+    first = [st for _, st in sorted(first, key=lambda t: -t[0])[:150]]
+    offs = {i: [] for i in range(len(srcs))}
+    for st in first:
+        r2 = psf_fit_stamp(st, srcs, aperture_arcsec, fit_offset=True,
+                           exclude_saturated=exclude_saturated)
+        for i, (dx, dy) in r2.get("shifts", {}).items():
+            px, py = st["wcs"].world_to_pixel(srcs[i])
+            c2 = st["wcs"].pixel_to_world(float(px) + dx, float(py) + dy)
+            o = srcs[i].spherical_offsets_to(c2)
+            offs[i].append((o[0].to(u.arcsec).value, o[1].to(u.arcsec).value))
+    for i in range(len(srcs)):
+        if len(offs[i]) >= 8:
+            o = np.median(np.array(offs[i]), axis=0)
+            if np.hypot(*o) < 4.0:
+                srcs[i] = srcs[i].spherical_offsets_by(o[0] * u.arcsec, o[1] * u.arcsec)
+                if i == 0:
+                    print(f"[INFO] PSF fit: target position refined from {len(offs[0])} exposures by "
+                          f"({o[0]:+.2f}\", {o[1]:+.2f}\")")
+    tc, neigh = srcs[0], srcs[1:]
+
+    # pass 2: forced photometry of every exposure
+    rec = []
+    for ep, r, st in rows:
+        res = psf_fit_stamp(st, [tc] + neigh, aperture_arcsec, exclude_saturated=exclude_saturated)
+        e_formal = res["err_mJy"] / np.sqrt(max(res["chi2r"], 1.0)) if np.isfinite(res["chi2r"]) else np.nan
+        if e_formal > 0 and res["flux_mJy"] / e_formal > PSF_FREE_POS_SNR:
+            res = psf_fit_stamp(st, [tc] + neigh, aperture_arcsec, fit_offset=True, max_shift=0.5,
+                                exclude_saturated=exclude_saturated)
+        rec.append(dict(epoch=ep, mjd=float(r["time_bounds_lower"]), band=int(r["band"]),
+                        lam=float(r["central_wavelength"]), bw=st["bw"], psf=st["psf_tag"],
+                        det=st["det_how"], **{k: res[k] for k in
+                        ("flux_mJy", "err_mJy", "chi2r", "npix", "n_sat_ap", "n_sat_fit",
+                         "core_lost", "bg", "dx", "dy")}))
+    S = pd.DataFrame(rec).sort_values(["epoch", "lam"])
+    S["ok"] = (np.isfinite(S.flux_mJy) & np.isfinite(S.err_mJy) & (S.err_mJy > 0)
+               & (S.core_lost.fillna(1.0) <= PSF_MAX_CORE_LOST))
+    S.to_csv(os.path.join("spectra", f"{target}_psf_samples.csv"), index=False)
+    n_sat = int((S.n_sat_ap > 0).sum())
+    print(f"[INFO] PSF fit: {int(S.ok.sum())}/{len(S)} exposures usable; {n_sat} have OVERFLOW/"
+          f"NONLINEAR pixels in the {aperture_arcsec}\" aperture"
+          + (" (left out of the fit, wings used)" if exclude_saturated else ""))
+
+    # spectra on the cube's wavelength grid
+    with fits.open(cube0) as h:
+        hd = h[0].header
+        waves = hd["CRVAL3"] + (np.arange(1, hd["NAXIS3"] + 1) - hd["CRPIX3"]) * hd["CDELT3"]
+    good = S[S.ok]
+    table_out = {"wavelength_um": waves}
+    ep_flux = []
+    for ep in sorted(good.epoch.unique()):
+        f, e, n, ns = psf_spectrum(good[good.epoch == ep], waves, resp_table, kernel_fwhm)
+        table_out[f"epoch{ep}_flux_psf_mJy"] = f
+        table_out[f"epoch{ep}_flux_err_mJy"] = e
+        table_out[f"epoch{ep}_nexp"] = n
+        table_out[f"epoch{ep}_nsat"] = ns
+        ep_flux.append((ep, f, e))
+    f, e, n, ns = psf_spectrum(good, waves, resp_table, kernel_fwhm)
+    table_out["all_exposures_flux_mJy"] = f
+    table_out["all_exposures_err_mJy"] = e
+    table_out["all_exposures_nsat"] = ns
+    F = np.array([x[1] for x in ep_flux]); E = np.array([x[2] for x in ep_flux])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        med = np.nanmedian(F, axis=0)
+        n_ok = np.sum(np.isfinite(F), axis=0)
+        mad = np.nanmedian(np.abs(F - med[None]), axis=0)
+        sig = np.fmax(np.nanmedian(E, axis=0), 1.4826 * mad)
+    table_out["median_of_epochs_flux_mJy"] = med
+    table_out["median_of_epochs_err_mJy"] = np.where(n_ok >= 2, 1.253 * sig / np.sqrt(np.maximum(n_ok, 1)),
+                                                     np.nanmedian(E, axis=0))
+    csv_name = os.path.join("spectra", f"{target}_psf_spectra_ap_{aperture_arcsec}.csv")
+    cols = list(table_out)
+    np.savetxt(csv_name, np.column_stack([table_out[c] for c in cols]), delimiter=",",
+               comments="# ", header=(
+                   f"SPHEREx PSF-fit spectra — Target: {target} (per epoch; all exposures; "
+                   f"median of epoch spectra = recommended)\n"
+                   f"Units: mJy (total PSF flux); RA {tc.ra.deg:.6f} Dec {tc.dec.deg:.6f}; "
+                   f"nsat = exposures with OVERFLOW/NONLINEAR pixels in the {aperture_arcsec}\" aperture\n"
+                   + ",".join(cols)))
+    print(f"PSF spectra CSV written: {csv_name}")
+    _plot_psf_spectra(target, waves, table_out, ep_flux, aperture_csv)
+    return csv_name
+
+
+def _plot_psf_spectra(target, waves, T, ep_flux, aperture_csv=None):
+    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
+    fig, ax = plt.subplots(3, 1, figsize=(9, 11), sharex=True,
+                           gridspec_kw=dict(height_ratios=[3, 1.6, 1]))
+    med = T["median_of_epochs_flux_mJy"]
+    ap = None
+    if aperture_csv and os.path.exists(aperture_csv):
+        try:
+            cols = open(aperture_csv).read().split("\n")[2].lstrip("# ").split(",")
+            ap = pd.DataFrame(np.loadtxt(aperture_csv, delimiter=","), columns=cols)
+        except Exception:
+            ap = None
+    for i, (ep, f, e) in enumerate(ep_flux):
+        ax[0].plot(waves, f, ".-", lw=0.8, ms=3, color=colors[i % 6], label=f"Epoch {ep} (PSF)")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ax[1].plot(waves, f / med, "-", lw=1.0, color=colors[i % 6])
+            if ap is not None and f"epoch{ep}_flux_annulus_sub_mJy" in ap and "median_of_epochs_flux_mJy" in ap:
+                ax[1].plot(ap.wavelength_um, ap[f"epoch{ep}_flux_annulus_sub_mJy"] / ap.median_of_epochs_flux_mJy,
+                           ":", lw=0.8, color=colors[i % 6])
+        ax[2].step(waves, T[f"epoch{ep}_nsat"], where="mid", color=colors[i % 6], lw=1)
+    ax[0].errorbar(waves, med, yerr=T["median_of_epochs_err_mJy"], fmt="-", color="k", lw=2,
+                   label="Median of epochs (PSF) — recommended", zorder=5)
+    if ap is not None and "median_of_epochs_flux_mJy" in ap:
+        ax[0].plot(ap.wavelength_um, ap.median_of_epochs_flux_mJy, "--", color="0.5", lw=1.2,
+                   label="Median of epochs (aperture)")
+    ax[0].set_ylabel("Flux density (mJy)"); ax[0].legend(fontsize=8); ax[0].grid(alpha=0.3)
+    ax[0].set_title(f"{target} — PSF-fit spectra")
+    ax[1].axhline(1, color="k", lw=0.5); ax[1].set_ylim(0.6, 1.4); ax[1].grid(alpha=0.3)
+    ax[1].set_ylabel("epoch / median\n(solid PSF, dotted aperture)", fontsize=8)
+    ax[2].set_ylabel("# exposures with\nsaturated pixels", fontsize=8); ax[2].grid(alpha=0.3)
+    ax[2].set_xlabel("Wavelength (µm)")
+    plt.tight_layout()
+    png = os.path.join("spectra", f"{target}_psf_spectra.png")
+    plt.savefig(png, dpi=200); plt.close(fig)
+    print(f"PSF spectra plot written: {png}")
+
+
+MIN_APERTURE_COVERAGE = 0.8  # a channel needs data over >= 80 % of the aperture area
+RECENTER_MAX_ARCSEC = 6.0     # recentring radius: the aperture moves to the significant SPHEREx
+                              # peak NEAREST the input position, within this distance (1 px).
+                              # (Before: the brightest peak within 12", often a neighbour.)
+
+
 def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
-                              aperture_arcsec=14.0, wl_plot=2.0,
+                              aperture_arcsec=14.0, wl_plot=4.0,
                               pixel_scale_arcsec=None, recenter=True,
-                              aperture_correct=False, mask_sources=True):
-    """recenter: centre the aperture on the source centroid in the cube (within 12").
+                              aperture_correct=False, mask_sources=True,
+                              recenter_max_arcsec=None, annulus_arcsec=None):
+    """recenter: centre the aperture on the significant SPHEREx peak nearest the input position
+    (within RECENTER_MAX_ARCSEC = 6"); False keeps the input position.
     aperture_correct (default False = off): divide by the point-source fraction inside the aperture, measured at
     each wavelength from field stars (curve of growth to 3 px = 18.5").  Only then does the
     CSV get an `apcorr` column with the factor applied to the annulus-subtracted fluxes.
@@ -1870,13 +2552,23 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
     primary_wl_sel = None
     skycoord = SkyCoord(ra_deg, dec_deg, unit="deg")
 
+    # background annulus: (inner, outer) radius in arcsec; default 1.5x-2.5x the aperture.
+    # For small apertures keep it outside the PSF wings (SPHEREx cube PSF FWHM ~ 12"), e.g. 21-35".
+    ann_in, ann_out = (annulus_arcsec if annulus_arcsec is not None
+                       else (1.5 * aperture_arcsec, 2.5 * aperture_arcsec))
+
     # ── v2.1: recentre, aperture correction and annulus mask, from the first cube ──
     apcorr, src_mask_img = None, None
     with fits.open(cube_list[0][0]) as h0:
         cube0, wcs0 = h0[0].data, WCS(h0[0].header).celestial
         pix0 = float(np.mean(proj_plane_pixel_scales(wcs0)) * 3600.0)
         if recenter and aperture_arcsec > 0:
-            new, off = find_source_centroid(cube0, wcs0, skycoord)
+            rmax = RECENTER_MAX_ARCSEC if recenter_max_arcsec is None else recenter_max_arcsec
+            new, off = find_source_centroid(cube0, wcs0, skycoord, search_arcsec=rmax)
+            if off > rmax:                       # centroid pulled away (neighbour): keep input
+                print(f"[INFO] SPHEREx centroid {off:.1f}\" away (> {rmax:g}\"): aperture kept at "
+                      f"the input position.")
+                new, off = skycoord, 0.0
             if off > 0:
                 print(f"[INFO] Aperture recentred on the SPHEREx centroid: {off:.1f}\" from the "
                       f"input position (RA {new.ra.deg:.6f}, Dec {new.dec.deg:.6f}).")
@@ -1891,18 +2583,23 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
                       f"{APCORR_REF_PIX * pix0:.1f}\").")
         if mask_sources and aperture_arcsec > 0:
             src_mask_img = source_mask(_median_image(cube0), exclude_xy=xy0,
-                                       exclude_r=aperture_arcsec / pix0 + 1.0)
+                                       exclude_r=max(aperture_arcsec, 0.5 * ann_in) / pix0 + 1.0)
 
     colors   = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
     sigclip  = SigmaClip(sigma=3.0, maxiters=5)
     generated_csvs = []
     epoch_spectra  = []          # (wavelengths, out_data) for every "Epoch N" cube
-    all_spectra    = []          # (label, wavelengths, out_data) for every cube
+    all_spectra    = []          # (label, wavelengths, out_data) for every extracted cube
+
+    # The combined (median-stacked) cube is used only for the image and for centring the
+    # aperture; its spectrum is not extracted when epoch cubes are available.
+    has_other = any(lbl != "Combined" for _, lbl in cube_list)
 
     for idx, (cube_path, label) in enumerate(cube_list):
         hdul       = fits.open(cube_path)
         data_cube  = hdul[0].data
         header     = hdul[0].header
+        skip_spec  = (label == "Combined" and has_other)
 
         has_unc  = "UNCERTAINTY" in hdul
         unc_cube = hdul["UNCERTAINTY"].data if has_unc else None
@@ -1918,6 +2615,16 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
 
         wcs = WCS(header).celestial
 
+        if idx == 0:
+            i_img = int(np.argmin(np.abs(wavelengths - wl_plot))) if wl_plot else n_waves // 2
+            primary_slice  = data_cube[i_img, :, :]
+            primary_wcs    = wcs
+            primary_wl_sel = wavelengths[i_img]
+
+        if skip_spec:
+            hdul.close()
+            continue
+
         # MJy/sr per pixel → mJy, using this cube's actual pixel solid angle
         pix_arcsec = (pixel_scale_arcsec if pixel_scale_arcsec is not None
                       else float(np.mean(proj_plane_pixel_scales(wcs)) * 3600.0))
@@ -1926,6 +2633,7 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
 
         fluxes_raw, fluxes_med_sub, fluxes_ann_sub = [], [], []
         bg_medians, bg_annuli, flux_errors          = [], [], []
+        ap_cover = np.ones(n_waves)       # fraction of the aperture with data, per channel
 
         if aperture_arcsec <= 0:
             px, py = wcs.world_to_pixel(skycoord)
@@ -1942,8 +2650,8 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
             sky_ap  = SkyCircularAperture(skycoord, r=aperture_arcsec * u.arcsec)
             sky_ann = SkyCircularAnnulus(
                 skycoord,
-                r_in=1.5  * aperture_arcsec * u.arcsec,
-                r_out=2.5 * aperture_arcsec * u.arcsec,
+                r_in=ann_in * u.arcsec,
+                r_out=ann_out * u.arcsec,
             )
             ap_pix  = sky_ap.to_pixel(wcs)
             ann_pix = sky_ann.to_pixel(wcs)
@@ -1951,6 +2659,8 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
 
             for i in range(n_waves):
                 sl = np.asarray(data_cube[i, :, :], float)
+                ap_cover[i] = aperture_photometry(np.isfinite(sl).astype(float),
+                                                  ap_pix)["aperture_sum"][0] / ap_area
 
                 raw = aperture_photometry(np.nan_to_num(sl, nan=0.0),
                                           ap_pix)["aperture_sum"][0]
@@ -1994,6 +2704,14 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
                 else np.ones(n_waves))
         fluxes_ann_sub = fluxes_ann_sub * corr
         flux_errors    = flux_errors * corr
+        # channels where the aperture is mostly empty (no exposure covered them) have no
+        # measurement: NaN instead of a spurious 0 / partial sum
+        empty = ap_cover < MIN_APERTURE_COVERAGE
+        if empty.any():
+            for arr in (fluxes_raw, fluxes_med_sub, fluxes_ann_sub, flux_errors):
+                arr[empty] = np.nan
+            print(f"[INFO] {label}: {int(empty.sum())} channel(s) with < "
+                  f"{MIN_APERTURE_COVERAGE:.0%} aperture coverage set to NaN")
 
         out_data = np.c_[
             wavelengths, mjds, fluxes_raw, fluxes_med_sub,
@@ -2010,14 +2728,7 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
             color=color, capsize=2,
         )
 
-        if idx == 0:
-            i_img = (np.argmin(np.abs(wavelengths - wl_plot))
-                     if wl_plot else np.argmax(fluxes_ann_sub))
-            primary_slice  = data_cube[i_img, :, :]
-            primary_wcs    = wcs
-            primary_wl_sel = wavelengths[i_img]
-
-    # ── ONE CSV: combined cube (standard columns), every epoch, median of epoch spectra ──
+    # ── ONE CSV: first epoch (standard columns), every other epoch, median of epoch spectra ──
     names8 = ["MJD", "flux_raw_mJy", "flux_median_sub_mJy", "flux_annulus_sub_mJy",
               "bg_median_total_mJy", "bg_annulus_total_mJy", "flux_err_mJy"]
     ref_label, ref_w, ref_d = all_spectra[0]
@@ -2027,7 +2738,9 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
     if apcorr is not None and apcorr.size == len(ref_w) and np.any(apcorr != 1):
         table_out["apcorr"] = apcorr        # only when aperture_correct=True
     same = lambda w: len(w) == len(ref_w) and np.allclose(w, ref_w)
-    for label, w, d in all_spectra[1:]:
+    # every epoch gets its own prefixed columns (the first epoch too), so readers that look for
+    # epochN_* columns see all epochs; the unprefixed columns above are kept for compatibility
+    for label, w, d in all_spectra:
         if not same(w):
             print(f"[WARNING] {label}: different wavelength grid, left out of the CSV.")
             continue
@@ -2053,7 +2766,7 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
     np.savetxt(csv_name, np.column_stack([table_out[c] for c in cols]), delimiter=",",
                comments="# ", header=(
                    f"SPHEREx Extracted Spectra — Target: {target} "
-                   f"(first columns: {ref_label} cube; then each epoch; then median of epoch spectra)\n"
+                   f"(unprefixed columns: {ref_label} cube; then epochN_ columns for every epoch; then median of epoch spectra)\n"
                    f"Units: mJy; annulus-subtracted fluxes "
                    f"{'are aperture-corrected (apcorr)' if (apcorr is not None and np.any(apcorr != 1)) else 'are NOT aperture-corrected'}, "
                    f"aperture centre RA {skycoord.ra.deg:.6f} Dec {skycoord.dec.deg:.6f}\n"
@@ -2079,15 +2792,15 @@ def plot_spectrum_from_cubes(cube_list, ra_deg, dec_deg,
             sky_ap  = SkyCircularAperture(skycoord, r=aperture_arcsec * u.arcsec)
             sky_ann = SkyCircularAnnulus(
                 skycoord,
-                r_in=1.5  * aperture_arcsec * u.arcsec,
-                r_out=2.5 * aperture_arcsec * u.arcsec,
+                r_in=ann_in * u.arcsec,
+                r_out=ann_out * u.arcsec,
             )
             sky_ap.to_pixel(primary_wcs).plot(
                 ax=ax2, color="cyan",   lw=1.5, label="Aperture")
             sky_ann.to_pixel(primary_wcs).plot(
                 ax=ax2, color="yellow", lw=1.0, ls="--", label="Annulus")
 
-        ax2.set_title(f"{target} Combined @ {primary_wl_sel:.4g} µm")
+        ax2.set_title(f"{target} {cube_list[0][1]} @ {primary_wl_sel:.4g} µm")
         ax2.set_xlabel("RA")
         ax2.set_ylabel("Dec")
 
@@ -2108,7 +2821,9 @@ def validate_spectrum_against_catalogs(csv_path, ra_deg, dec_deg,
                      .str.replace(r"^#\s*", "", regex=True)
                      .str.strip())
 
-    if "flux_annulus_sub_mJy" in df_sp.columns:
+    if "median_of_epochs_flux_mJy" in df_sp.columns:
+        flux_col, err_col = "median_of_epochs_flux_mJy", "median_of_epochs_err_mJy"
+    elif "flux_annulus_sub_mJy" in df_sp.columns:
         flux_col, err_col = "flux_annulus_sub_mJy", "flux_err_mJy"
     elif "flux_annulus_sub" in df_sp.columns:
         flux_col, err_col = "flux_annulus_sub", "flux_err"
@@ -2182,11 +2897,67 @@ def parse_coordinates(ra_val, dec_val):
                      unit=(u.hourangle, u.deg), frame="icrs")
     return c.ra.deg, c.dec.deg
 
+SIMBAD_MIRRORS = ["simbad.cds.unistra.fr",   # Strasbourg (CDS)
+                  "simbad.harvard.edu"]      # Harvard mirror, used if Strasbourg does not reply
+SIMBAD_TIMEOUT_S = 30
+
+
+def _simbad_client(server):
+    """Simbad client bound to one mirror.  The server is set before anything touches the
+    network (astroquery's own `timeout` is SIMBAD's async execution limit and contacts the
+    default Strasbourg server when set, so it is not used here)."""
+    from astroquery.simbad import SimbadClass
+    client = SimbadClass()
+    if hasattr(client, "server"):              # astroquery >= 0.4.8 (TAP)
+        client.server = server
+    else:                                      # older astroquery (sim-script)
+        client.SIMBAD_URL = f"https://{server}/simbad/sim-script"
+    return client
+
+
+def _query_with_timeout(func, timeout_s):
+    """Run func() in a daemon thread; raise TimeoutError if it has not returned in timeout_s
+    (a mirror that accepts the connection but never answers would otherwise hang the run)."""
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box["result"] = func()
+        except Exception as e:
+            box["error"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise TimeoutError(f"no reply within {timeout_s} s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
 def resolve_simbad(name):
-    result = Simbad.query_object(name)
-    if result is None or len(result) == 0:
-        raise ValueError(f"SIMBAD could not resolve '{name}'")
-    return parse_coordinates(result["ra"][0], result["dec"][0])
+    """Name -> (ra, dec) via SIMBAD, trying Strasbourg first and the Harvard mirror if
+    Strasbourg does not reply.  A name SIMBAD answers but cannot resolve is not retried."""
+    last_err = None
+    for server in SIMBAD_MIRRORS:
+        try:
+            result = _query_with_timeout(lambda: _simbad_client(server).query_object(name),
+                                         SIMBAD_TIMEOUT_S)
+        except Exception as e:                 # timeout / connection error / server error
+            last_err = e
+            msg = str(e).strip().splitlines()[0] if str(e).strip() else ""
+            print(f"[WARNING] SIMBAD at {server} did not reply ({type(e).__name__}: {msg}); "
+                  + ("trying the Harvard mirror." if server != SIMBAD_MIRRORS[-1] else "no mirror left."))
+            continue
+        if result is None or len(result) == 0:
+            raise ValueError(f"SIMBAD ({server}) could not resolve '{name}'")
+        if server != SIMBAD_MIRRORS[0]:
+            print(f"[INFO] Resolved '{name}' with the SIMBAD mirror {server}.")
+        cols = {c.lower(): c for c in result.colnames}
+        return parse_coordinates(result[cols["ra"]][0], result[cols["dec"]][0])
+    raise ConnectionError(f"No SIMBAD mirror replied for '{name}' (last error: {last_err})")
 
 def process_target(
     ra, dec, name, size, aperture_arcsec,
@@ -2195,11 +2966,17 @@ def process_target(
     min_cutouts_per_epoch=100, pixel_scale_arcsec=6.15,
     resample_method="drizzle", require_good_astrometry=True,
     pixfrac=0.6, spectral_method="kernel", kernel="response", kernel_fwhm=1.0,
-    response_file="auto", fill_gaps=True,
+    response_file="auto", fill_gaps=True, photometry="aperture",
+    recenter=True, recenter_max_arcsec=None, annulus_arcsec=None, save_images=False,
+    mask_saturated="overflow",
 ):
+    """photometry: "psf" (per-exposure PSF fitting, best for close pairs and saturated
+    stars), "aperture" (annulus-subtracted aperture on the cubes) or "both"."""
+    psf_photometry = photometry in ("psf", "both")
+    do_aperture = photometry in ("aperture", "both")
     print(f"\n[INFO] Processing {name} (RA={ra:.6f}, Dec={dec:.6f})")
     try:
-        created_cubes = make_datacubes(
+        created_cubes, epoch_rows = make_datacubes(
             ra, dec, size, name,
             color_by_wavelength=color_by_wavelength,
             subtract_zodi=subtract_zodi,
@@ -2216,10 +2993,31 @@ def process_target(
             kernel_fwhm=kernel_fwhm,
             response_file=response_file,
             fill_gaps=fill_gaps,
+            psf_stamps=psf_photometry,
+            return_rows=True,
+            save_images=save_images,
+            bad_flags=DEFAULT_BAD_FLAGS + saturation_flags(mask_saturated),
         )
-        csv_files = plot_spectrum_from_cubes(
-            created_cubes, ra, dec, aperture_arcsec=aperture_arcsec
-        )
+        csv_files = (plot_spectrum_from_cubes(created_cubes, ra, dec,
+                                              aperture_arcsec=aperture_arcsec,
+                                              recenter=recenter,
+                                              recenter_max_arcsec=recenter_max_arcsec,
+                                              annulus_arcsec=annulus_arcsec)
+                     if do_aperture else [])
+        if psf_photometry:
+            try:
+                resp = resolve_response(response_file) if kernel == "response" else None
+                psf_csv = run_psf_photometry(
+                    epoch_rows, created_cubes, name, ra, dec,
+                    aperture_arcsec=aperture_arcsec, resp_table=resp, kernel_fwhm=kernel_fwhm,
+                    aperture_csv=(csv_files[0] if csv_files else None),
+                    recenter=recenter, recenter_max_arcsec=recenter_max_arcsec)
+                if psf_csv:
+                    csv_files = list(csv_files) + [psf_csv]
+            except Exception as e_psf:
+                import traceback
+                print(f"[WARNING] PSF photometry failed: {e_psf}")
+                traceback.print_exc()
         if validate_photometry and csv_files:
             for csv_path in csv_files:
                 validate_spectrum_against_catalogs(csv_path, ra, dec)
@@ -2282,26 +3080,32 @@ if __name__ == "__main__":
             pixfrac = float(input("Drizzle pixfrac (smaller = sharper, noisier) "
                                   "[default=0.6]: ").strip() or 0.6)
             cutout_size = cutout_arcmin * u.arcminute
-            spectral_method = (input("Spectral method: kernel (v2) / pchip (v1) [default=kernel]: ")
-                               .strip().lower() or "kernel")
-            kernel, kernel_fwhm, response_file = "response", 1.0, "auto"
-            if spectral_method == "kernel":
-                kernel = (input("Spectral kernel: response (SSDC R7 filter response) / tent "
-                                "[default=response]: ").strip().lower() or "response")
-                if kernel not in ("response",) + tuple(SPECTRAL_KERNELS):
-                    print(f"[WARNING] Unknown kernel '{kernel}', using response.")
-                    kernel = "response"
-                if kernel == "response":
-                    response_file = (input("SSDC R7 responses [default=auto: R7 CSV folder if present, "
-                                           "else profiles from R7 Table 2 built into this script]: ")
-                                     .strip() or "auto")
-                kernel_fwhm = float(input("Kernel FWHM in resolution elements lambda/R "
-                                          "[default=1.0]: ").strip() or 1.0)
+            # Fixed settings (no longer prompted): kernel binning with the SSDC R7 filter
+            # response (auto: R7 CSV folder if present, else built-in R7 Table 2 profiles),
+            # FWHM = 1 resolution element, bad-pixel FLAGS masked, no colour-by-wavelength.
+            spectral_method = "kernel"
+            kernel          = "response"
+            response_file   = "auto"
+            kernel_fwhm     = 1.0
+            mask_flags      = True
+            color_by_wavelength = False
 
+            photometry = (input("Photometry: aperture / psf (experimental) / both "
+                                "[default=aperture]: ").strip().lower() or "aperture")
+            if photometry not in ("psf", "aperture", "both"):
+                print(f"[WARNING] Unknown photometry '{photometry}', using aperture.")
+                photometry = "aperture"
+            save_images = input("Save the downloaded SPHEREx cutout images (for manual checks)? "
+                                "(y/n) [default=n]: ").strip().lower() in ("y", "yes")
+            recenter = input("Recenter on the nearest SPHEREx peak within 6\" of the input position? "
+                             "(y/n) [default=y]: ").strip().lower() in ("y", "yes", "")
+            mask_saturated = (input("Mask saturated pixels: overflow (fully saturated) / nonlinear "
+                                    "(also NONLINEAR) / none [default=overflow]: ").strip().lower()
+                              or "overflow")
+            if mask_saturated not in SATURATION_MASKS:
+                print(f"[WARNING] Unknown choice '{mask_saturated}', using overflow.")
+                mask_saturated = "overflow"
             subtract_zodi = input("Subtract Zodiacal Light? (y/n) [default=y]: ").strip().lower() in ("y","yes","")
-            mask_flags    = input("Mask bad-pixel FLAGS (cosmic rays, hot/cold, persistence; never SOURCE)? "
-                                  "(y/n) [default=y]: ").strip().lower() in ("y","yes","")
-            color_by_wavelength = input("Color by wavelength? (y/n) [default=n]: ").strip().lower() in ("y","yes")
             validate_photometry = input("Validate vs 2MASS/WISE? (y/n) [default=n]: ").strip().lower() in ("y","yes")
 
             run_kwargs = dict(
@@ -2317,6 +3121,10 @@ if __name__ == "__main__":
                 kernel=kernel,
                 kernel_fwhm=kernel_fwhm,
                 response_file=response_file,
+                photometry=photometry,
+                recenter=recenter,
+                save_images=save_images,
+                mask_saturated=mask_saturated,
             )
 
             if mode == "1":
@@ -2368,7 +3176,7 @@ if __name__ == "__main__":
                 dec_in = input("Target Dec: ").strip()
                 ra, dec = parse_coordinates(ra_in, dec_in)
                 validate_radec(ra, dec)
-                wl_plot = float(input("Image wavelength (µm) [default=2.0]: ").strip() or 2.0)
+                wl_plot = float(input("Image wavelength (µm) [default=4.0]: ").strip() or 4.0)
                 csv_files = plot_spectrum_from_cubes(
                     [(cube_file, "Existing Datacube")], ra, dec,
                     aperture_arcsec=aperture_arcsec, wl_plot=wl_plot)
